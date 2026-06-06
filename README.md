@@ -17,7 +17,7 @@ This repository provides a GLB loader node for Rive artboards, designed to impor
 
 ## Notes
 
-- This `.riv` is an example using a relatively heavy GLB file (~9 MB) with 5 animations.
+- This `.rev` is an example using a relatively heavy GLB file (~3 MB) with no animation.
 - You have many exposed properties available for testing.
 - If needed, you can ask the agent to expose or add more properties.
 - It is strongly recommended to **always add a new GLB Loader node** into your artboard for each model, to avoid mismatches between models.
