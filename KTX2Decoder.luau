@@ -156,32 +156,8 @@ local MODE_EP_RANGES = {
 	19, 20, 8, 7, 12, 20, 18, 12, 0, 8, 13, 13, 19, 20, 20, 20, 20, 20, 11,
 }
 
-local MODE_SUBSETS = {
-	1, 1, 2, 3, 2, 1, 1, 2, 0, 2, 1, 1, 1, 1, 1, 1, 2, 1, 1,
-}
-
-local MODE_PLANES = {
-	1, 1, 1, 1, 1, 1, 2, 1, 0, 1, 1, 2, 1, 2, 1, 1, 1, 2, 1,
-}
-
 local MODE_COMPS = {
 	3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 2, 2, 2, 3,
-}
-
-local MODE_HAS_BIAS = {
-	1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 0, 0, 0, 1, 1, 1, 1, 1, 1,
-}
-
-local MODE_HAS_HINT0 = {
-	1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-}
-
-local MODE_HAS_HINT1 = {
-	1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 0, 0, 0, 1, 1, 1, 1, 1, 1,
-}
-
-local MODE_HAS_ALPHA = {
-	0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0,
 }
 
 local MODE_HINT_BITS = {
@@ -456,6 +432,10 @@ type Etc1sCodebooks = {
 	selRows: { { number } },
 	numEndpoints: number,
 	numSelectors: number,
+	-- lazy per-endpoint table of the 4 packed RGBA colors (little-endian u32)
+	colorLUT: { { number }? },
+	-- lazy per-endpoint table of the 4 alpha values (green channel decode)
+	alphaLUT: { { number }? },
 }
 
 local function decodePalettes(
@@ -547,7 +527,7 @@ local function decodePalettes(
 	end
 	local usedRaw = bitsGet(sb, 1) == 1
 
-	local selRows: { { number } } = table.create(numSelectors)
+	local selRows = {} :: { { number } }
 	if usedRaw then
 		for i = 1, numSelectors do
 			local rows = table.create(4, 0)
@@ -591,6 +571,8 @@ local function decodePalettes(
 		selRows = selRows,
 		numEndpoints = numEndpoints,
 		numSelectors = numSelectors,
+		colorLUT = {} :: { { number }? },
+		alphaLUT = {} :: { { number }? },
 	}, nil
 end
 
@@ -1276,6 +1258,7 @@ local function decode(bytes: buffer): (DecodedTexture?, string?)
 			-- decode the alpha slice first (alpha goes to the A channel from
 			-- the green channel of the decoded blocks), then the color slice.
 			if hasAlpha then
+				local alphaLUT = cb.alphaLUT
 				local aerr = transcodeSlice(
 					cb,
 					tb,
@@ -1285,18 +1268,28 @@ local function decode(bytes: buffer): (DecodedTexture?, string?)
 					numBlocksX,
 					numBlocksY,
 					function(bx: number, by: number, epIdx: number, selIdx: number)
-						local g5 = cb.endG[epIdx + 1]
-						local inten = ETC1_INTEN[cb.endI[epIdx + 1] + 1]
-						local gBase = bor(lshift(g5, 3), rshift(g5, 2))
+						local lut = alphaLUT[epIdx + 1]
+						if not lut then
+							local g5 = cb.endG[epIdx + 1]
+							local inten = ETC1_INTEN[cb.endI[epIdx + 1] + 1]
+							local gBase = bor(lshift(g5, 3), rshift(g5, 2))
+							lut = {
+								clamp255(gBase + inten[1]),
+								clamp255(gBase + inten[2]),
+								clamp255(gBase + inten[3]),
+								clamp255(gBase + inten[4]),
+							}
+							alphaLUT[epIdx + 1] = lut
+						end
+						local lt = lut :: { number }
 						local rows = cb.selRows[selIdx + 1]
 						local maxX = math.min(4, width - bx * 4)
 						local maxY = math.min(4, height - by * 4)
 						for y = 0, maxY - 1 do
 							local s = rows[y + 1]
-							local p = (by * 4 + y) * rowStride + bx * 16
+							local p = (by * 4 + y) * rowStride + bx * 16 + 3
 							for x = 0, maxX - 1 do
-								local sel = band(rshift(s, x * 2), 3)
-								buffer.writeu8(rgba, p + x * 4 + 3, clamp255(gBase + inten[sel + 1]))
+								buffer.writeu8(rgba, p + x * 4, lt[band(rshift(s, x * 2), 3) + 1])
 							end
 						end
 					end
@@ -1306,6 +1299,9 @@ local function decode(bytes: buffer): (DecodedTexture?, string?)
 				end
 			end
 
+			local colorLUT = cb.colorLUT
+			-- packed-u32 colors carry alpha 255; when an alpha slice was
+			-- decoded first we must preserve the A byte instead.
 			local serr = transcodeSlice(
 				cb,
 				tb,
@@ -1315,28 +1311,48 @@ local function decode(bytes: buffer): (DecodedTexture?, string?)
 				numBlocksX,
 				numBlocksY,
 				function(bx: number, by: number, epIdx: number, selIdx: number)
-					local r5 = cb.endR[epIdx + 1]
-					local g5 = cb.endG[epIdx + 1]
-					local b5 = cb.endB[epIdx + 1]
-					local inten = ETC1_INTEN[cb.endI[epIdx + 1] + 1]
-					local rBase = bor(lshift(r5, 3), rshift(r5, 2))
-					local gBase = bor(lshift(g5, 3), rshift(g5, 2))
-					local bBase = bor(lshift(b5, 3), rshift(b5, 2))
+					local lut = colorLUT[epIdx + 1]
+					if not lut then
+						local r5 = cb.endR[epIdx + 1]
+						local g5 = cb.endG[epIdx + 1]
+						local b5 = cb.endB[epIdx + 1]
+						local inten = ETC1_INTEN[cb.endI[epIdx + 1] + 1]
+						local rBase = bor(lshift(r5, 3), rshift(r5, 2))
+						local gBase = bor(lshift(g5, 3), rshift(g5, 2))
+						local bBase = bor(lshift(b5, 3), rshift(b5, 2))
+						local built = {} :: { number }
+						for k = 1, 4 do
+							local m = inten[k]
+							built[k] = clamp255(rBase + m)
+								+ clamp255(gBase + m) * 256
+								+ clamp255(bBase + m) * 65536
+								+ 4278190080 -- alpha 255 << 24
+						end
+						colorLUT[epIdx + 1] = built
+						lut = built
+					end
+					local lt = lut :: { number }
 					local rows = cb.selRows[selIdx + 1]
 					local maxX = math.min(4, width - bx * 4)
 					local maxY = math.min(4, height - by * 4)
-					for y = 0, maxY - 1 do
-						local s = rows[y + 1]
-						local p = (by * 4 + y) * rowStride + bx * 16
-						for x = 0, maxX - 1 do
-							local sel = band(rshift(s, x * 2), 3)
-							local m = inten[sel + 1]
-							local px = p + x * 4
-							buffer.writeu8(rgba, px, clamp255(rBase + m))
-							buffer.writeu8(rgba, px + 1, clamp255(gBase + m))
-							buffer.writeu8(rgba, px + 2, clamp255(bBase + m))
-							if not hasAlpha then
-								buffer.writeu8(rgba, px + 3, 255)
+					if hasAlpha then
+						for y = 0, maxY - 1 do
+							local s = rows[y + 1]
+							local p = (by * 4 + y) * rowStride + bx * 16
+							for x = 0, maxX - 1 do
+								local c = lt[band(rshift(s, x * 2), 3) + 1]
+								local px = p + x * 4
+								buffer.writeu8(rgba, px, band(c, 255))
+								buffer.writeu8(rgba, px + 1, band(rshift(c, 8), 255))
+								buffer.writeu8(rgba, px + 2, band(rshift(c, 16), 255))
+							end
+						end
+					else
+						for y = 0, maxY - 1 do
+							local s = rows[y + 1]
+							local p = (by * 4 + y) * rowStride + bx * 16
+							for x = 0, maxX - 1 do
+								buffer.writeu32(rgba, p + x * 4, lt[band(rshift(s, x * 2), 3) + 1])
 							end
 						end
 					end

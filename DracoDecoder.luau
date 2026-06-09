@@ -1198,7 +1198,7 @@ local function traversalIsOnBoundary(t: TraversalTable, v: number): boolean
 	return o < 0
 end
 
-local function traverseDepthFirst(t: TraversalTable, enc: EncData, isFaceVisited: { boolean }, isVertexVisited: { boolean })
+local function traverseDepthFirst(t: TraversalTable, enc: EncData, isFaceVisited: { boolean }, isVertexVisited: { boolean }): string?
 	local function getRight(c: number): number
 		return t.oppositeOf(cNext(c))
 	end
@@ -1288,7 +1288,7 @@ local function traverseMaxPredictionDegree(
 	enc: EncData,
 	isFaceVisited: { boolean },
 	isVertexVisited: { boolean }
-)
+): string?
 	local kMaxPriority = 3
 	local predictionDegree = table.create(t.numVertices, 0)
 	local stacks: { { number } } = { {}, {}, {} }
@@ -1605,19 +1605,6 @@ end
 -- ---------------------------------------------------------------------------
 -- main decoder
 -- ---------------------------------------------------------------------------
-local DT_SIZES: { [number]: number } = {
-	[1] = 1, -- INT8
-	[2] = 1, -- UINT8
-	[3] = 2, -- INT16
-	[4] = 2, -- UINT16
-	[5] = 4, -- INT32
-	[6] = 4, -- UINT32
-	[7] = 8, -- INT64
-	[8] = 8, -- UINT64
-	[9] = 4, -- FLOAT32
-	[10] = 8, -- FLOAT64
-	[11] = 1, -- BOOL
-}
 
 local function readDataValue(r: Reader, dataType: number): number
 	if dataType == 1 then

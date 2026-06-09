@@ -16,7 +16,6 @@
 
 local band = bit32.band
 local bor = bit32.bor
-local bxor = bit32.bxor
 local rshift = bit32.rshift
 local lshift = bit32.lshift
 
@@ -323,7 +322,6 @@ type LHuff = { map: { [number]: number }, maxLen: number }
 
 local function lHuffBuild(codeLengths: { number }, numSymbols: number): (LHuff?, string?)
 	local counts = table.create(16, 0)
-	local total = 0
 	local maxLen = 0
 	local numUsed = 0
 	local lastSym = 0
@@ -558,7 +556,7 @@ local function lReadHuffmanCodes(dec: LDec, xsize: number, ysize: number, cacheB
 		dec.huffImage = image
 	end
 	dec.cacheBits = cacheBits
-	local groups: { LGroup } = table.create(numGroups)
+	local groups = {} :: { LGroup }
 	local greenAlphabet = 256 + 24 + (if cacheBits > 0 then lshift(1, cacheBits) else 0)
 	for i = 1, numGroups do
 		local g, e1 = lReadHuffmanCode(dec, greenAlphabet)
@@ -838,7 +836,6 @@ local function lApplyInverseTransforms(
 		if tr.ttype == 0 then
 			-- PREDICTOR
 			local bits = tr.bits
-			local mask = lshift(1, bits) - 1
 			local tilesPerRow = subSampleSize(width, bits)
 			local modes = tr.data :: { number }
 			-- first pixel: black (add), rest of first row: left
@@ -2020,9 +2017,9 @@ local function decodeVP8(buf: buffer, base: number, len: number): (buffer?, buff
 		nonZeroUV: number,
 		coeffs: { number }, -- 384 values
 	}
-	local rowMB: { MBData } = table.create(mbW)
+	local rowMB = {} :: { MBData }
 	-- filter info per MB (whole frame)
-	local fInfo: { { number } } = table.create(mbW * mbH)
+	local fInfo = {} :: { { number } }
 
 	for mbY = 0, mbH - 1 do
 		-- parse intra modes for the row (from partition 0 / header bd)

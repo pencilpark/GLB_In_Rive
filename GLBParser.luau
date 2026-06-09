@@ -813,8 +813,9 @@ local function parse(data: buffer): ParseResult
 		if t and t.index ~= nil then
 			local transform: UVTransform? = nil
 			local texCoord = (t.texCoord or 0) :: number
-			if t.extensions and t.extensions.KHR_texture_transform then
-				local tt = t.extensions.KHR_texture_transform :: any
+			local textInfoExts = t.extensions :: any
+			if textInfoExts and textInfoExts.KHR_texture_transform then
+				local tt = textInfoExts.KHR_texture_transform :: any
 				local off = tt.offset or {}
 				local sc = tt.scale or {}
 				transform = {
@@ -893,12 +894,14 @@ local function parse(data: buffer): ParseResult
 		for _, tRaw in ipairs(jsonData.textures) do
 			local t = tRaw :: any
 			local source = t.source
-			local texts = t.extensions
+			local texts = t.extensions :: any
 			if texts then
-				if texts.KHR_texture_basisu and texts.KHR_texture_basisu.source ~= nil then
-					source = texts.KHR_texture_basisu.source
-				elseif texts.EXT_texture_webp and texts.EXT_texture_webp.source ~= nil then
-					source = texts.EXT_texture_webp.source
+				local basisu = texts.KHR_texture_basisu :: any
+				local webp = texts.EXT_texture_webp :: any
+				if basisu and basisu.source ~= nil then
+					source = basisu.source
+				elseif webp and webp.source ~= nil then
+					source = webp.source
 				end
 			end
 			table.insert(textures, { source = source, sampler = t.sampler })
