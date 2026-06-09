@@ -10,8 +10,8 @@ inutilisables dans Rive. Objectif: décoder les 4 formats en pur Luau.
 - [x] 1. Environnement de test: luau CLI + gltf-transform + gltfpack + fixtures
 - [x] 2. MeshoptDecoder.luau (EXT_meshopt_compression: index codec, vertex codec v0/v1, filtres oct/quat/exp)
 - [x] 3. Intégration meshopt dans GLBParser (bufferViews décodés à la volée) + test vs gltfpack
-- [ ] 4. DracoDecoder.luau (rANS, edgebreaker standard+valence, séquentiel, prédictions, déquantification)
-- [ ] 5. Intégration Draco dans GLBParser (overrides d'accessors par primitive) + test vs gltf-transform/Blender
+- [x] 4. DracoDecoder.luau (rANS, edgebreaker standard+valence, séquentiel, prédictions, déquantification)
+- [x] 5. Intégration Draco dans GLBParser (overrides d'accessors par primitive) + test vs gltf-transform/Blender
 - [ ] 6. ZstdDecoder.luau (RFC 8878: FSE, huffman, séquences) — requis pour KTX2/UASTC
 - [ ] 7. KTX2Decoder.luau (conteneur KTX2, BasisLZ→ETC1S→RGBA, UASTC→RGBA, zstd)
 - [ ] 8. WebPDecoder.luau (VP8L lossless, VP8 lossy intra, canal alpha) — fallback si decodeImage natif échoue
