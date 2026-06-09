@@ -7,7 +7,16 @@
   - Header (12 bytes): magic, version, total length
   - JSON chunk: scene description, mesh metadata, accessors, buffer views
   - BIN chunk: raw binary data (vertices, indices, etc.)
+
+  Compressed GLBs are decoded in pure Luau at parse time:
+  - EXT_meshopt_compression  -> bufferViews decoded via MeshoptDecoder
+  - KHR_draco_mesh_compression -> primitives decoded via DracoDecoder
+  KHR_texture_basisu / EXT_texture_webp images are decoded later, on the
+  texture path (see GLBModel), since they only affect images.
 ]]
+
+local MeshoptDecoder = require('MeshoptDecoder')
+local DracoDecoder = require('DracoDecoder')
 
 export type BufferView = {
 	byteOffset: number,
@@ -40,11 +49,19 @@ export type Accessor = {
 	normalized: boolean?,
 }
 
+-- KHR_draco_mesh_compression payload on a primitive: the compressed
+-- bufferView plus the semantic -> draco-attribute-unique-id map.
+export type DracoExt = {
+	bufferView: number,
+	attributes: { [string]: number },
+}
+
 export type Primitive = {
 	attributes: { [string]: number },
 	indices: number?,
 	material: number?,
 	mode: number?,
+	draco: DracoExt?,
 }
 
 export type Mesh = {
@@ -98,9 +115,19 @@ export type Animation = {
 	samplers: { AnimationSampler },
 }
 
+-- KHR_texture_transform: affine UV transform attached to a texture slot.
+export type UVTransform = {
+	offsetX: number,
+	offsetY: number,
+	scaleX: number,
+	scaleY: number,
+	rotation: number, -- radians
+}
+
 export type TextureInfo = {
 	index: number, -- index into textures
 	texCoord: number, -- UV set, default 0
+	transform: UVTransform?, -- KHR_texture_transform, if present
 }
 
 export type Material = {
@@ -147,6 +174,13 @@ export type GLBData = {
 	accessors: { Accessor },
 	bufferViews: { BufferView },
 	binChunk: buffer,
+	-- Decoded bytes for compressed bufferViews (1-based view index). When a
+	-- view has an entry here, readers use it (offset 0) instead of binChunk.
+	viewData: { [number]: buffer },
+	-- Decoded values for compressed accessors (1-based accessor index), flat
+	-- component arrays produced by the Draco decoder. Takes priority over the
+	-- accessor's bufferView. Values are final (dequantized) for float types.
+	accessorOverrides: { [number]: { number } },
 	nodes: { Node }?,
 	skins: { Skin }?,
 	animations: { Animation }?,
@@ -417,18 +451,19 @@ local function parse(data: buffer): ParseResult
 			if not jsonData then
 				return { success = false, error = "Failed to parse JSON chunk" }
 			end
-			-- Extension compatibility report. Some extensions store data in a way
-			-- our raw byte reads cannot decode (compressed geometry/textures) --
-			-- those are BLOCKING and we fail loudly with actionable advice. Others
-			-- are purely additive (extra material features) -- those are safely
-			-- IGNORED, and we log them so the user knows what was skipped.
+			-- Extension compatibility report. Compressed-data extensions are
+			-- DECODED in pure Luau (meshopt/Draco at parse time here; Basis-KTX2
+			-- and WebP later on the texture path). Additive material extensions
+			-- are safely IGNORED; anything unknown is logged.
 			do
-				-- Extensions we cannot decode in pure Luau: fail with guidance.
-				local BLOCKING: { [string]: string } = {
+				-- Extensions decoded by this loader.
+				local DECODED: { [string]: string } = {
 					["KHR_draco_mesh_compression"] = "Draco mesh compression",
 					["EXT_meshopt_compression"] = "meshopt compression",
 					["KHR_texture_basisu"] = "Basis/KTX2 compressed textures",
 					["EXT_texture_webp"] = "WebP textures",
+					["KHR_texture_transform"] = "UV transforms (baked into UVs)",
+					["KHR_mesh_quantization"] = "quantized attributes",
 				}
 				-- Extensions that are safe to ignore (rendering still works, just
 				-- without that specific embellishment).
@@ -442,48 +477,32 @@ local function parse(data: buffer): ParseResult
 					["KHR_materials_volume"] = true,
 					["KHR_materials_specular"] = true,
 					["KHR_lights_punctual"] = true,
-					["KHR_texture_transform"] = true,
 					["KHR_materials_variants"] = true,
-					["KHR_mesh_quantization"] = true,
 				}
 
 				local jd = jsonData :: any
-				-- A required extension that is blocking aborts the load.
-				local req = jd.extensionsRequired :: { string }?
-				if req then
-					for _, ext in ipairs(req) do
-						local label = BLOCKING[ext]
-						if label then
-							return {
-								success = false,
-								error = "GLB requires '"
-									.. ext
-									.. "' ("
-									.. label
-									.. ") which cannot be decoded in this runtime. "
-									.. "Re-export the model WITHOUT that feature "
-									.. "(e.g. `gltf-transform decompress`/`uncompress`, or disable "
-									.. "compression/Basis textures on export).",
-							}
-						end
-					end
-				end
-				-- Report every extension that is merely USED (not required) but that
-				-- we don't implement, so the user understands any visual difference.
 				local used = jd.extensionsUsed :: { string }?
 				if used then
 					for _, ext in ipairs(used) do
-						if not BLOCKING[ext] and not KNOWN_IGNORED[ext] then
+						if DECODED[ext] then
 							print(
-								"[GLBParser] note: extension '"
+								"[GLBParser] extension '"
 									.. tostring(ext)
-									.. "' is used but not implemented -- ignored."
+									.. "' ("
+									.. DECODED[ext]
+									.. ") -- decoded."
 							)
 						elseif KNOWN_IGNORED[ext] then
 							print(
 								"[GLBParser] note: extension '"
 									.. tostring(ext)
 									.. "' ignored (model renders without it)."
+							)
+						else
+							print(
+								"[GLBParser] note: extension '"
+									.. tostring(ext)
+									.. "' is used but not implemented -- ignored."
 							)
 						end
 					end
@@ -507,6 +526,7 @@ local function parse(data: buffer): ParseResult
 		indices: number?,
 		material: number?,
 		mode: number?,
+		extensions: any?,
 	}
 	type JsonMesh = { name: string?, primitives: { JsonPrimitive }? }
 	type JsonAccessor = {
@@ -529,6 +549,7 @@ local function parse(data: buffer): ParseResult
 		byteLength: number,
 		byteStride: number?,
 		target: number?,
+		extensions: any?,
 	}
 	type JsonNode = {
 		name: string?,
@@ -581,11 +602,23 @@ local function parse(data: buffer): ParseResult
 			if meshJson.primitives then
 				for _, primJsonRaw in ipairs(meshJson.primitives) do
 					local primJson = primJsonRaw :: JsonPrimitive
+					local draco: DracoExt? = nil
+					local pexts = primJson.extensions
+					if pexts and pexts.KHR_draco_mesh_compression then
+						local de = pexts.KHR_draco_mesh_compression :: any
+						if de.bufferView ~= nil and de.attributes ~= nil then
+							draco = {
+								bufferView = de.bufferView :: number,
+								attributes = de.attributes :: { [string]: number },
+							}
+						end
+					end
 					local prim: Primitive = {
 						attributes = primJson.attributes or {},
 						indices = primJson.indices,
 						material = primJson.material,
 						mode = primJson.mode or 4, -- Default to TRIANGLES
+						draco = draco,
 					}
 					table.insert(mesh.primitives, prim)
 				end
@@ -627,10 +660,14 @@ local function parse(data: buffer): ParseResult
 		end
 	end
 
-	-- Extract buffer views
+	-- Extract buffer views. Views compressed with EXT_meshopt_compression are
+	-- decoded right here into viewData (the readers then use the decoded bytes
+	-- at offset 0 instead of binChunk). The view's declared buffer is the
+	-- optional fallback buffer, which GLBs produced by gltfpack don't carry.
 	local bufferViews: { BufferView } = {}
+	local viewData: { [number]: buffer } = {}
 	if jsonData.bufferViews then
-		for _, bvJsonRaw in ipairs(jsonData.bufferViews) do
+		for bvIndex, bvJsonRaw in ipairs(jsonData.bufferViews) do
 			local bvJson = bvJsonRaw :: JsonBufferView
 			local bv: BufferView = {
 				byteOffset = bvJson.byteOffset or 0,
@@ -638,6 +675,46 @@ local function parse(data: buffer): ParseResult
 				byteStride = bvJson.byteStride,
 				target = bvJson.target,
 			}
+			local exts = bvJson.extensions
+			local mo = if exts then exts.EXT_meshopt_compression :: any else nil
+			if mo and binChunk then
+				local count = mo.count :: number
+				local stride = mo.byteStride :: number
+				local mode = (mo.mode or "ATTRIBUTES") :: string
+				local filter = mo.filter :: string?
+				local srcOffset = (mo.byteOffset or 0) :: number
+				local srcLength = mo.byteLength :: number
+				if (mo.buffer or 0) ~= 0 then
+					print("[GLBParser] meshopt: compressed data in buffer "
+						.. tostring(mo.buffer)
+						.. " unsupported (only the GLB BIN chunk); view "
+						.. tostring(bvIndex - 1)
+						.. " left undecoded.")
+				else
+					local src = buffer.create(srcLength)
+					buffer.copy(src, 0, binChunk :: buffer, srcOffset, srcLength)
+					local decoded, derr =
+						MeshoptDecoder.decodeBufferView(src, count, stride, mode, filter)
+					if decoded then
+						viewData[bvIndex] = decoded
+						-- The decoded bytes are tightly packed at `stride`; make the
+						-- view describe them so the readers stay consistent.
+						bv.byteOffset = 0
+						bv.byteLength = count * stride
+						if mode == "ATTRIBUTES" then
+							bv.byteStride = stride
+						end
+					else
+						return {
+							success = false,
+							error = "EXT_meshopt_compression decode failed on bufferView "
+								.. tostring(bvIndex - 1)
+								.. ": "
+								.. tostring(derr),
+						}
+					end
+				end
+			end
 			table.insert(bufferViews, bv)
 		end
 	end
@@ -734,7 +811,29 @@ local function parse(data: buffer): ParseResult
 	-- Extract materials (PBR metallic-roughness core + common texture slots)
 	local function texInfo(t: any): TextureInfo?
 		if t and t.index ~= nil then
-			return { index = t.index :: number, texCoord = (t.texCoord or 0) :: number }
+			local transform: UVTransform? = nil
+			local texCoord = (t.texCoord or 0) :: number
+			local textInfoExts = t.extensions :: any
+			if textInfoExts and textInfoExts.KHR_texture_transform then
+				local tt = textInfoExts.KHR_texture_transform :: any
+				local off = tt.offset or {}
+				local sc = tt.scale or {}
+				transform = {
+					offsetX = (off[1] or 0) :: number,
+					offsetY = (off[2] or 0) :: number,
+					scaleX = (sc[1] or 1) :: number,
+					scaleY = (sc[2] or 1) :: number,
+					rotation = (tt.rotation or 0) :: number,
+				}
+				if tt.texCoord ~= nil then
+					texCoord = tt.texCoord :: number
+				end
+			end
+			return {
+				index = t.index :: number,
+				texCoord = texCoord,
+				transform = transform,
+			}
 		end
 		return nil
 	end
@@ -786,12 +885,26 @@ local function parse(data: buffer): ParseResult
 		end
 	end
 
-	-- Extract textures / images / samplers (indices stay glTF 0-based)
+	-- Extract textures / images / samplers (indices stay glTF 0-based).
+	-- KHR_texture_basisu / EXT_texture_webp move the image reference into a
+	-- texture extension; resolve it here so texture.source always points at
+	-- the actual image (KTX2/WebP bytes are decoded on the texture path).
 	local textures: { TextureDef } = {}
 	if jsonData.textures then
 		for _, tRaw in ipairs(jsonData.textures) do
 			local t = tRaw :: any
-			table.insert(textures, { source = t.source, sampler = t.sampler })
+			local source = t.source
+			local texts = t.extensions :: any
+			if texts then
+				local basisu = texts.KHR_texture_basisu :: any
+				local webp = texts.EXT_texture_webp :: any
+				if basisu and basisu.source ~= nil then
+					source = basisu.source
+				elseif webp and webp.source ~= nil then
+					source = webp.source
+				end
+			end
+			table.insert(textures, { source = source, sampler = t.sampler })
 		end
 	end
 	local images: { ImageDef } = {}
@@ -809,12 +922,68 @@ local function parse(data: buffer): ParseResult
 		end
 	end
 
+	-- Decode KHR_draco_mesh_compression primitives. Each compressed primitive
+	-- owns one bufferView with a Draco stream; decoding yields the indices plus
+	-- one value array per attribute (keyed by the draco attribute unique id,
+	-- which the extension maps from the glTF semantic). Decoded arrays override
+	-- the primitive's accessors (whose bufferView is absent for Draco data).
+	local accessorOverrides: { [number]: { number } } = {}
+	for meshIndex, mesh in ipairs(meshes) do
+		for primIndex, prim in ipairs(mesh.primitives) do
+			local de = prim.draco
+			if de and binChunk then
+				local bv = bufferViews[de.bufferView + 1]
+				if not bv then
+					return {
+						success = false,
+						error = "Draco bufferView " .. de.bufferView .. " missing",
+					}
+				end
+				local src = buffer.create(bv.byteLength)
+				buffer.copy(src, 0, binChunk :: buffer, bv.byteOffset, bv.byteLength)
+				local decoded, derr = DracoDecoder.decode(src)
+				if not decoded then
+					return {
+						success = false,
+						error = string.format(
+							"Draco decode failed (mesh %d, primitive %d): %s",
+							meshIndex - 1,
+							primIndex - 1,
+							tostring(derr)
+						),
+					}
+				end
+				local dm = decoded :: DracoDecoder.DracoMesh
+				if prim.indices ~= nil then
+					accessorOverrides[prim.indices + 1] = dm.indices
+				end
+				for sem, uid in pairs(de.attributes) do
+					local accIndex = prim.attributes[sem]
+					local attr = dm.attributes[uid]
+					if accIndex ~= nil and attr then
+						accessorOverrides[accIndex + 1] = attr.values
+					else
+						print(
+							"[GLBParser] draco: attribute '"
+								.. tostring(sem)
+								.. "' (unique id "
+								.. tostring(uid)
+								.. ") not found in the decoded stream -- skipped."
+						)
+					end
+				end
+			end
+		end
+	end
+
 	local result: GLBData = {
 		version = header.version,
 		meshes = meshes,
 		accessors = accessors,
 		bufferViews = bufferViews,
 		binChunk = binChunk :: buffer,
+		viewData = viewData,
+		accessorOverrides = accessorOverrides,
 		nodes = nodes,
 		skins = skins,
 		animations = animations,
@@ -839,32 +1008,58 @@ local function getTypeComponents(accessorType: string): number
 	return TYPE_COMPONENTS[accessorType] or 0
 end
 
--- Read a single typed scalar from the bin chunk by glTF componentType.
-local function readComponent(glb: GLBData, componentType: number, offset: number): number
+-- Read a single typed scalar from a byte buffer by glTF componentType.
+local function readComponent(buf: buffer, componentType: number, offset: number): number
 	if componentType == 5126 then
-		return readF32(glb.binChunk, offset) -- FLOAT
+		return readF32(buf, offset) -- FLOAT
 	elseif componentType == 5123 then
-		return readU16(glb.binChunk, offset) -- UNSIGNED_SHORT
+		return readU16(buf, offset) -- UNSIGNED_SHORT
 	elseif componentType == 5125 then
-		return readU32(glb.binChunk, offset) -- UNSIGNED_INT
+		return readU32(buf, offset) -- UNSIGNED_INT
 	elseif componentType == 5121 then
-		return buffer.readu8(glb.binChunk, offset) -- UNSIGNED_BYTE
+		return buffer.readu8(buf, offset) -- UNSIGNED_BYTE
 	elseif componentType == 5122 then
 		-- SHORT (signed)
-		local v = readU16(glb.binChunk, offset)
+		local v = readU16(buf, offset)
 		if v >= 32768 then
 			v = v - 65536
 		end
 		return v
 	elseif componentType == 5120 then
 		-- BYTE (signed)
-		local v = buffer.readu8(glb.binChunk, offset)
+		local v = buffer.readu8(buf, offset)
 		if v >= 128 then
 			v = v - 256
 		end
 		return v
 	end
 	return 0
+end
+
+-- Resolve a bufferView (1-based index) to the byte buffer holding its data
+-- plus the view's base offset inside that buffer. Decoded compressed views
+-- live in glb.viewData (base offset 0); everything else reads the BIN chunk.
+local function viewSource(glb: GLBData, viewIndex: number): (buffer, number)
+	local decoded = glb.viewData[viewIndex]
+	if decoded then
+		return decoded, 0
+	end
+	local bv = glb.bufferViews[viewIndex]
+	return glb.binChunk, if bv then bv.byteOffset else 0
+end
+
+-- glTF `normalized` integer -> float conversion factor/clamping per spec.
+local function normalizeComponent(componentType: number, v: number): number
+	if componentType == 5121 then
+		return v / 255
+	elseif componentType == 5123 then
+		return v / 65535
+	elseif componentType == 5120 then
+		return math.max(v / 127, -1)
+	elseif componentType == 5122 then
+		return math.max(v / 32767, -1)
+	end
+	return v
 end
 
 -- Apply a sparse accessor's (indices, values) overrides onto a flat result
@@ -879,14 +1074,16 @@ local function applySparse(glb: GLBData, accessor: Accessor, componentCount: num
 	if not idxBV or not valBV then
 		return
 	end
+	local idxBuf, idxViewBase = viewSource(glb, sparse.indicesBufferView + 1)
+	local valBuf, valViewBase = viewSource(glb, sparse.valuesBufferView + 1)
 	local idxCompSize = getComponentSize(sparse.indicesComponentType)
 	local valCompSize = getComponentSize(accessor.componentType)
-	local idxBase = idxBV.byteOffset + sparse.indicesByteOffset
-	local valBase = valBV.byteOffset + sparse.valuesByteOffset
+	local idxBase = idxViewBase + sparse.indicesByteOffset
+	local valBase = valViewBase + sparse.valuesByteOffset
 	for k = 0, sparse.count - 1 do
-		local elemIndex = readComponent(glb, sparse.indicesComponentType, idxBase + k * idxCompSize)
+		local elemIndex = readComponent(idxBuf, sparse.indicesComponentType, idxBase + k * idxCompSize)
 		for j = 0, componentCount - 1 do
-			local v = readComponent(glb, accessor.componentType, valBase + (k * componentCount + j) * valCompSize)
+			local v = readComponent(valBuf, accessor.componentType, valBase + (k * componentCount + j) * valCompSize)
 			result[elemIndex * componentCount + j + 1] = v
 		end
 	end
@@ -894,7 +1091,9 @@ end
 
 -- Read accessor data as array of numbers (for positions, normals, etc.).
 -- Supports sparse accessors and accessors with no bufferView (all-zero base
--- that is then overridden by the sparse data).
+-- that is then overridden by the sparse data). Draco-decoded accessors come
+-- from glb.accessorOverrides. Integer accessors marked `normalized` are
+-- converted to floats per the glTF spec (KHR_mesh_quantization).
 local function readAccessorFloats(glb: GLBData, accessorIndex: number): { number }?
 	if accessorIndex < 1 or accessorIndex > #glb.accessors then
 		return nil
@@ -909,17 +1108,32 @@ local function readAccessorFloats(glb: GLBData, accessorIndex: number): { number
 	end
 
 	local result: { number } = {}
+	local override = glb.accessorOverrides[accessorIndex]
+
+	if override then
+		-- Draco-decoded values (already dequantized for float accessor types).
+		if accessor.normalized then
+			for i = 1, #override do
+				result[i] = normalizeComponent(accessor.componentType, override[i])
+			end
+		else
+			table.move(override, 1, #override, 1, result)
+		end
+		return result
+	end
+
 	local bufferView = glb.bufferViews[accessor.bufferView + 1] -- Convert to 1-indexed
 
 	if bufferView then
 		-- Normal path: read the base bufferView data.
+		local buf, viewBase = viewSource(glb, accessor.bufferView + 1)
 		local stride = bufferView.byteStride or (componentSize * componentCount)
-		local baseOffset = bufferView.byteOffset + accessor.byteOffset
+		local baseOffset = viewBase + accessor.byteOffset
 		for i = 0, accessor.count - 1 do
 			local elementOffset = baseOffset + i * stride
 			for j = 0, componentCount - 1 do
 				result[i * componentCount + j + 1] =
-					readComponent(glb, accessor.componentType, elementOffset + j * componentSize)
+					readComponent(buf, accessor.componentType, elementOffset + j * componentSize)
 			end
 		end
 	elseif accessor.sparse then
@@ -937,6 +1151,12 @@ local function readAccessorFloats(glb: GLBData, accessorIndex: number): { number
 		applySparse(glb, accessor, componentCount, result)
 	end
 
+	if accessor.normalized then
+		for i = 1, #result do
+			result[i] = normalizeComponent(accessor.componentType, result[i])
+		end
+	end
+
 	return result
 end
 
@@ -947,14 +1167,23 @@ local function readIndices(glb: GLBData, accessorIndex: number): { number }?
 	end
 
 	local accessor = glb.accessors[accessorIndex]
+
+	local override = glb.accessorOverrides[accessorIndex]
+	if override then
+		local result: { number } = {}
+		table.move(override, 1, #override, 1, result)
+		return result
+	end
+
 	local bufferView = glb.bufferViews[accessor.bufferView + 1]
 
 	if not bufferView then
 		return nil
 	end
 
+	local buf, viewBase = viewSource(glb, accessor.bufferView + 1)
 	local componentSize = getComponentSize(accessor.componentType)
-	local baseOffset = bufferView.byteOffset + accessor.byteOffset
+	local baseOffset = viewBase + accessor.byteOffset
 	local result: { number } = {}
 
 	for i = 0, accessor.count - 1 do
@@ -963,13 +1192,13 @@ local function readIndices(glb: GLBData, accessorIndex: number): { number }?
 
 		if accessor.componentType == 5123 then
 			-- UNSIGNED_SHORT
-			value = readU16(glb.binChunk, valueOffset)
+			value = readU16(buf, valueOffset)
 		elseif accessor.componentType == 5125 then
 			-- UNSIGNED_INT
-			value = readU32(glb.binChunk, valueOffset)
+			value = readU32(buf, valueOffset)
 		elseif accessor.componentType == 5121 then
 			-- UNSIGNED_BYTE
-			value = buffer.readu8(glb.binChunk, valueOffset)
+			value = buffer.readu8(buf, valueOffset)
 		else
 			value = 0
 		end
@@ -987,12 +1216,21 @@ local function readJoints(glb: GLBData, accessorIndex: number): { number }?
 	end
 
 	local accessor = glb.accessors[accessorIndex]
+
+	local override = glb.accessorOverrides[accessorIndex]
+	if override then
+		local result: { number } = {}
+		table.move(override, 1, #override, 1, result)
+		return result
+	end
+
 	local bufferView = glb.bufferViews[accessor.bufferView + 1]
 
 	if not bufferView then
 		return nil
 	end
 
+	local buf, viewBase = viewSource(glb, accessor.bufferView + 1)
 	local componentSize = getComponentSize(accessor.componentType)
 	local componentCount = getTypeComponents(accessor.accessorType) -- Should be 4 for VEC4
 
@@ -1001,7 +1239,7 @@ local function readJoints(glb: GLBData, accessorIndex: number): { number }?
 	end
 
 	local stride = bufferView.byteStride or (componentSize * componentCount)
-	local baseOffset = bufferView.byteOffset + accessor.byteOffset
+	local baseOffset = viewBase + accessor.byteOffset
 	local result: { number } = {}
 
 	for i = 0, accessor.count - 1 do
@@ -1012,10 +1250,10 @@ local function readJoints(glb: GLBData, accessorIndex: number): { number }?
 
 			if accessor.componentType == 5121 then
 				-- UNSIGNED_BYTE
-				value = buffer.readu8(glb.binChunk, valueOffset)
+				value = buffer.readu8(buf, valueOffset)
 			elseif accessor.componentType == 5123 then
 				-- UNSIGNED_SHORT
-				value = readU16(glb.binChunk, valueOffset)
+				value = readU16(buf, valueOffset)
 			else
 				value = 0
 			end
@@ -1058,7 +1296,8 @@ local function getAnimationDuration(glb: GLBData, animIndex: number): number
 	return maxTime
 end
 
--- Extract embedded image bytes (PNG/JPEG) for a glTF image index (0-based).
+-- Extract embedded image bytes (PNG/JPEG/WebP/KTX2) for a glTF image index
+-- (0-based).
 local function imageBytes(glb: GLBData, imageIndex: number): buffer?
 	local img = glb.images[imageIndex + 1]
 	if not img or img.bufferView == nil then
@@ -1068,8 +1307,9 @@ local function imageBytes(glb: GLBData, imageIndex: number): buffer?
 	if not bv then
 		return nil
 	end
+	local buf, viewBase = viewSource(glb, img.bufferView + 1)
 	local out = buffer.create(bv.byteLength)
-	buffer.copy(out, 0, glb.binChunk, bv.byteOffset, bv.byteLength)
+	buffer.copy(out, 0, buf, viewBase, bv.byteLength)
 	return out
 end
 

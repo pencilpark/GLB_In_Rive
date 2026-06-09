@@ -14,6 +14,8 @@ local GLBParser = require('GLBParser')
 local GLTFMesh = require('GLTFMesh')
 local Math3D = require('Math3D')
 local SceneGraph = require('SceneGraph')
+local KTX2Decoder = require('KTX2Decoder')
+local WebPDecoder = require('WebPDecoder')
 
 -- ---------------------------------------------------------------------------
 -- GPU API shims (type-checker only).
@@ -463,9 +465,45 @@ local function rebuildMatBinds(self: Model)
   objBuf:write(objBytes, 0)
 end
 
--- Decode one embedded GLB image (by glTF image index) to RGBA and upload it to a
--- GPUTexture, caching the view in self.imageViews. Async via context:decodeImage
--- (reliable + alpha-preserving). Rebuilds the binds when each image arrives.
+-- Upload a decoded RGBA image to a GPUTexture and cache its view for the
+-- given glTF image index, then refresh the material binds.
+local function uploadDecodedImage(
+  self: Model,
+  imageIndex: number,
+  width: number,
+  height: number,
+  rgba: buffer,
+  label: string
+)
+  local tex = GPUTexture.new({
+    width = width,
+    height = height,
+    format = 'rgba8unorm',
+  })
+  tex:upload({ data = rgba })
+  table.insert(self.imageTextures, tex) -- keep alive
+  self.imageViews[imageIndex] = tex:view()
+  rebuildMatBinds(self)
+  if self.context then
+    self.context:markNeedsUpdate()
+  end
+  print(
+    string.format(
+      '[GLBModel.tex] decoded GLB image %d -> %dx%d (%s)',
+      imageIndex,
+      width,
+      height,
+      label
+    )
+  )
+end
+
+-- Decode one embedded GLB image (by glTF image index) to RGBA and upload it
+-- to a GPUTexture, caching the view in self.imageViews.
+--   * KTX2 (KHR_texture_basisu: ETC1S / UASTC) -> pure-Luau KTX2Decoder
+--   * WebP (EXT_texture_webp) -> context:decodeImage if the runtime
+--     supports it, with the pure-Luau WebPDecoder as fallback
+--   * PNG/JPEG -> async context:decodeImage as before
 local function decodeGLBImage(self: Model, context: Context, imageIndex: number)
   local glb = self.glb
   if not glb then
@@ -484,37 +522,82 @@ local function decodeGLBImage(self: Model, context: Context, imageIndex: number)
     )
     return
   end
-  (context :: any):decodeImage(bytes):andThen(function(decoded)
-    local tex = GPUTexture.new({
-      width = decoded.width,
-      height = decoded.height,
-      format = 'rgba8unorm',
-    })
-    tex:upload({ data = decoded.data })
-    table.insert(self.imageTextures, tex) -- keep alive
-    self.imageViews[imageIndex] = tex:view()
-    rebuildMatBinds(self)
-    if self.context then
-      self.context:markNeedsUpdate()
+
+  if KTX2Decoder.isKTX2(bytes) then
+    -- Basis Universal texture: the runtime image decoder can't read these;
+    -- transcode to RGBA on the CPU (level 0 only -- no mip chain here).
+    local tex, kerr = KTX2Decoder.decode(bytes)
+    if tex then
+      local t = tex :: KTX2Decoder.DecodedTexture
+      uploadDecodedImage(self, imageIndex, t.width, t.height, t.rgba, 'KTX2')
+    else
+      print(
+        '[GLBModel.tex] KTX2 decode failed for GLB image '
+          .. tostring(imageIndex)
+          .. ': '
+          .. tostring(kerr)
+      )
     end
-    print(
-      string.format(
-        '[GLBModel.tex] decoded GLB image %d -> %dx%d',
+    return
+  end
+
+  local isWebP = WebPDecoder.isWebP(bytes)
+  local function decodeWebPFallback(nativeErr: any)
+    local img, werr = WebPDecoder.decode(bytes)
+    if img then
+      local m = img :: WebPDecoder.DecodedImage
+      uploadDecodedImage(self, imageIndex, m.width, m.height, m.rgba, 'WebP')
+    else
+      print(
+        '[GLBModel.tex] WebP decode failed for GLB image '
+          .. tostring(imageIndex)
+          .. ': native='
+          .. tostring(nativeErr)
+          .. ' luau='
+          .. tostring(werr)
+      )
+    end
+  end
+
+  local okCall, callErr = pcall(function()
+    (context :: any):decodeImage(bytes):andThen(function(decoded)
+      uploadDecodedImage(
+        self,
         imageIndex,
         decoded.width,
-        decoded.height
+        decoded.height,
+        decoded.data,
+        'native'
       )
-    )
-    return nil
-  end, function(err)
-    print(
-      '[GLBModel.tex] decodeImage failed for GLB image '
-        .. tostring(imageIndex)
-        .. ': '
-        .. tostring(err)
-    )
-    return nil
+      return nil
+    end, function(err)
+      if isWebP then
+        -- this runtime build can't decode WebP natively; use the pure-Luau
+        -- decoder instead
+        decodeWebPFallback(err)
+      else
+        print(
+          '[GLBModel.tex] decodeImage failed for GLB image '
+            .. tostring(imageIndex)
+            .. ': '
+            .. tostring(err)
+        )
+      end
+      return nil
+    end)
   end)
+  if not okCall then
+    if isWebP then
+      decodeWebPFallback(callErr)
+    else
+      print(
+        '[GLBModel.tex] decodeImage call failed for GLB image '
+          .. tostring(imageIndex)
+          .. ': '
+          .. tostring(callErr)
+      )
+    end
+  end
 end
 
 -- Kick off decoding of every embedded image referenced by a material's

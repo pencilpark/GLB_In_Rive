@@ -78,6 +78,86 @@ local function writeU32LE(b: buffer, off: number, v: number)
   buffer.writeu8(b, off + 3, math.floor(v / 16777216) % 256)
 end
 
+-- KHR_texture_transform (gltfpack emits it to undo UV quantization): find the
+-- transforms a material applies to UV set 0 and UV set 1. The first texture
+-- slot using each set wins; differing transforms within one set can't be baked
+-- into shared vertex UVs, so they're reported once and the first is used.
+local function uvTransformsFor(
+  glb: GLBData,
+  materialIndex: number?
+): (GLBParser.UVTransform?, GLBParser.UVTransform?)
+  if materialIndex == nil then
+    return nil, nil
+  end
+  local mat = glb.materials[materialIndex + 1]
+  if not mat then
+    return nil, nil
+  end
+  local slots: { GLBParser.TextureInfo? } = {
+    mat.baseColorTexture,
+    mat.metallicRoughnessTexture,
+    mat.normalTexture,
+    mat.emissiveTexture,
+    mat.occlusionTexture,
+  }
+  local t0: GLBParser.UVTransform? = nil
+  local t1: GLBParser.UVTransform? = nil
+  local conflict = false
+  for _, info in ipairs(slots) do
+    if info and info.transform then
+      local t = info.transform :: GLBParser.UVTransform
+      if info.texCoord == 1 then
+        if t1 == nil then
+          t1 = t
+        elseif t1 ~= t then
+          local p = t1 :: GLBParser.UVTransform
+          conflict = conflict
+            or p.offsetX ~= t.offsetX
+            or p.offsetY ~= t.offsetY
+            or p.scaleX ~= t.scaleX
+            or p.scaleY ~= t.scaleY
+            or p.rotation ~= t.rotation
+        end
+      else
+        if t0 == nil then
+          t0 = t
+        elseif t0 ~= t then
+          local p = t0 :: GLBParser.UVTransform
+          conflict = conflict
+            or p.offsetX ~= t.offsetX
+            or p.offsetY ~= t.offsetY
+            or p.scaleX ~= t.scaleX
+            or p.scaleY ~= t.scaleY
+            or p.rotation ~= t.rotation
+        end
+      end
+    end
+  end
+  if conflict then
+    print(
+      '[GLTFMesh] note: material '
+        .. tostring(materialIndex)
+        .. ' uses different KHR_texture_transform values per texture slot; '
+        .. 'baking the first one into the UVs.'
+    )
+  end
+  return t0, t1
+end
+
+-- Apply a KHR_texture_transform to a flat {u,v,...} array in place:
+-- uv' = Translation * Rotation * Scale * uv.
+local function applyUVTransform(uvs: { number }, t: GLBParser.UVTransform)
+  local c = math.cos(t.rotation)
+  local s = math.sin(t.rotation)
+  local count = math.floor(#uvs / 2)
+  for i = 0, count - 1 do
+    local u = uvs[i * 2 + 1]
+    local v = uvs[i * 2 + 2]
+    uvs[i * 2 + 1] = t.scaleX * c * u + t.scaleY * s * v + t.offsetX
+    uvs[i * 2 + 2] = -t.scaleX * s * u + t.scaleY * c * v + t.offsetY
+  end
+end
+
 -- Smooth normals: accumulate triangle face normals per vertex, then normalise.
 -- `positions` and `indices` are flat 0-based arrays; returns flat {nx,ny,nz,...}.
 function GLTFMesh.computeNormals(
@@ -270,9 +350,19 @@ function GLTFMesh.buildPrimitive(glb: GLBData, prim: Primitive): DrawItem?
     uvs1 = GLBParser.readAccessorFloats(glb, prim.attributes.TEXCOORD_1 + 1)
   end
 
-  -- Vertex colours (COLOR_0). May be VEC3 or VEC4; default white. glTF allows
-  -- normalised ubyte/ushort here, which readAccessorFloats returns as raw
-  -- integers, so we normalise those component types to 0..1.
+  -- Bake the material's KHR_texture_transform into the UVs (gltfpack relies
+  -- on it to map quantized UVs back to their true range).
+  local uvT0, uvT1 = uvTransformsFor(glb, prim.material)
+  if uvs and uvT0 then
+    applyUVTransform(uvs :: { number }, uvT0 :: GLBParser.UVTransform)
+  end
+  if uvs1 and uvT1 then
+    applyUVTransform(uvs1 :: { number }, uvT1 :: GLBParser.UVTransform)
+  end
+
+  -- Vertex colours (COLOR_0). May be VEC3 or VEC4; default white. glTF marks
+  -- integer colours `normalized` (readAccessorFloats then returns 0..1); the
+  -- manual scale below only covers non-conforming files with raw integers.
   local colors: { number }? = nil
   local colorComps = 4
   local colorScale = 1
@@ -282,10 +372,12 @@ function GLTFMesh.buildPrimitive(glb: GLBData, prim: Primitive): DrawItem?
     local acc = glb.accessors[accIdx]
     if acc then
       colorComps = if acc.accessorType == 'VEC3' then 3 else 4
-      if acc.componentType == 5121 then
-        colorScale = 1 / 255 -- normalised UBYTE
-      elseif acc.componentType == 5123 then
-        colorScale = 1 / 65535 -- normalised USHORT
+      if not acc.normalized then
+        if acc.componentType == 5121 then
+          colorScale = 1 / 255 -- raw UBYTE
+        elseif acc.componentType == 5123 then
+          colorScale = 1 / 65535 -- raw USHORT
+        end
       end
     end
   end
@@ -436,6 +528,15 @@ function GLTFMesh.buildSkinData(glb: GLBData, prim: Primitive): SkinData?
     uvs1 = GLBParser.readAccessorFloats(glb, prim.attributes.TEXCOORD_1 + 1)
       or {}
   end
+  -- Bake the material's KHR_texture_transform into the UVs (same as
+  -- buildPrimitive, so skinned rebuilds keep the corrected UVs).
+  local uvT0, uvT1 = uvTransformsFor(glb, prim.material)
+  if uvT0 then
+    applyUVTransform(uvs, uvT0 :: GLBParser.UVTransform)
+  end
+  if uvT1 then
+    applyUVTransform(uvs1, uvT1 :: GLBParser.UVTransform)
+  end
   -- Colours, normalised to 0..1 rgba (same logic as buildPrimitive).
   local colors: { number } = {}
   if prim.attributes.COLOR_0 ~= nil then
@@ -444,7 +545,7 @@ function GLTFMesh.buildSkinData(glb: GLBData, prim: Primitive): SkinData?
     local acc = glb.accessors[accIdx]
     local comps = if acc and acc.accessorType == 'VEC3' then 3 else 4
     local scale = 1
-    if acc then
+    if acc and not acc.normalized then
       if acc.componentType == 5121 then
         scale = 1 / 255
       elseif acc.componentType == 5123 then
