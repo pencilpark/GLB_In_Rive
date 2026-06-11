@@ -1,8 +1,8 @@
 --!strict
 -- SceneGraph
 -- Node hierarchy -> world matrices, world-space AABB (for camera fit), and
--- glTF animation sampling (TRS keyframes: LINEAR / STEP / CUBICSPLINE).
--- All maths via Math3D so it stays headless-testable.
+-- glTF animation sampling (TRS + morph "weights" keyframes: LINEAR / STEP /
+-- CUBICSPLINE). All maths via Math3D so it stays headless-testable.
 
 local GLBParser = require('GLBParser')
 local M3 = require('Math3D')
@@ -341,53 +341,153 @@ local function sampleChannel(
   end
 end
 
--- Sample an animation clip at time t -> per-node TRS overrides (node index 0-based).
+-- Number of morph targets on the mesh of a node (0-based node index). Per the
+-- glTF spec every primitive of a mesh declares the same target count, so the
+-- first primitive is authoritative.
+local function morphTargetCount(glb: GLBData, nodeIndex: number): number
+  local nodes = glb.nodes
+  if not nodes then
+    return 0
+  end
+  local node = nodes[nodeIndex + 1]
+  if not node or node.mesh == nil then
+    return 0
+  end
+  local mesh = glb.meshes[node.mesh + 1]
+  if not mesh then
+    return 0
+  end
+  local prim = mesh.primitives[1]
+  if not prim or not prim.targets then
+    return 0
+  end
+  return #(prim.targets :: { { [string]: number } })
+end
+
+-- Sample an animation clip at time t. Returns
+--   1) per-node TRS overrides (node index 0-based), and
+--   2) per-node interpolated morph weights for "weights" channels, or nil
+--      when the clip animates no morph weights.
+-- A "weights" sampler stores numTargets scalars per keyframe (3x that for
+-- CUBICSPLINE: in-tangent, value, out-tangent), so it is sampled as one
+-- numTargets-wide tuple through the same interpolation code as TRS.
 function SceneGraph.sampleClip(
   glb: GLBData,
   animIndex: number,
   t: number
-): { [number]: TRSOverride }
+): ({ [number]: TRSOverride }, { [number]: { number } }?)
   local overrides: { [number]: TRSOverride } = {}
+  local weights: { [number]: { number } }? = nil
   if not glb.animations then
-    return overrides
+    return overrides, nil
   end
   local anim = glb.animations[animIndex]
   if not anim then
-    return overrides
+    return overrides, nil
   end
   for _, channel in ipairs(anim.channels) do
     local target = channel.target
     local path = target.path
-    if target.node ~= nil and path ~= 'weights' then
+    if target.node ~= nil then
       local sampler = anim.samplers[channel.sampler + 1]
       if sampler then
         local times = GLBParser.readAccessorFloats(glb, sampler.input + 1)
         local values = GLBParser.readAccessorFloats(glb, sampler.output + 1)
         if times and values then
-          local isRot = path == 'rotation'
-          local comps = if isRot then 4 else 3
-          local result = sampleChannel(
-            times,
-            values,
-            comps,
-            t,
-            sampler.interpolation or 'LINEAR',
-            isRot
-          )
-          local ov: TRSOverride = overrides[target.node] or {}
-          if path == 'translation' then
-            ov.translation = result
-          elseif path == 'rotation' then
-            ov.rotation = result
-          elseif path == 'scale' then
-            ov.scale = result
+          if path == 'weights' then
+            local numTargets = morphTargetCount(glb, target.node)
+            if numTargets > 0 then
+              local result = sampleChannel(
+                times,
+                values,
+                numTargets,
+                t,
+                sampler.interpolation or 'LINEAR',
+                false
+              )
+              local w = weights or {}
+              w[target.node] = result
+              weights = w
+            end
+          elseif
+            path == 'translation'
+            or path == 'rotation'
+            or path == 'scale'
+          then
+            local isRot = path == 'rotation'
+            local comps = if isRot then 4 else 3
+            local result = sampleChannel(
+              times,
+              values,
+              comps,
+              t,
+              sampler.interpolation or 'LINEAR',
+              isRot
+            )
+            local ov: TRSOverride = overrides[target.node] or {}
+            if path == 'translation' then
+              ov.translation = result
+            elseif path == 'rotation' then
+              ov.rotation = result
+            else
+              ov.scale = result
+            end
+            overrides[target.node] = ov
           end
-          overrides[target.node] = ov
         end
       end
     end
   end
-  return overrides
+  return overrides, weights
+end
+
+-- ---- morph targets (CPU) -----------------------------------------------------
+
+-- Deform a primitive's LOCAL positions/normals with its morph targets:
+-- result = base + sum(weights[i] * delta_i). Deltas are read through
+-- readAccessorFloats, so sparse / Draco-overridden delta accessors work.
+-- TANGENT deltas are ignored. Returns (positions?, normals?); both nil when
+-- the primitive has no morph targets, and normals nil when the primitive has
+-- no NORMAL attribute.
+function SceneGraph.applyMorphs(
+  glb: GLBData,
+  prim: GLBParser.Primitive,
+  weights: { number }
+): ({ number }?, { number }?)
+  local targets = prim.targets
+  if not targets or #targets == 0 then
+    return nil, nil
+  end
+  local tgs: { { [string]: number } } = targets
+  local function deform(attrIdx: number?, semantic: string): { number }?
+    if attrIdx == nil then
+      return nil
+    end
+    local base = GLBParser.readAccessorFloats(glb, attrIdx + 1)
+    if not base then
+      return nil
+    end
+    local out = table.clone(base :: { number })
+    for ti, tmap in ipairs(tgs) do
+      local w = weights[ti] or 0
+      if w ~= 0 then
+        local deltaIdx = tmap[semantic]
+        if deltaIdx ~= nil then
+          local delta = GLBParser.readAccessorFloats(glb, deltaIdx + 1)
+          if delta then
+            local d = delta :: { number }
+            local n = math.min(#out, #d)
+            for i = 1, n do
+              out[i] += w * d[i]
+            end
+          end
+        end
+      end
+    end
+    return out
+  end
+  return deform(prim.attributes.POSITION, 'POSITION'),
+    deform(prim.attributes.NORMAL, 'NORMAL')
 end
 
 -- ---- skinning (CPU) --------------------------------------------------------
@@ -586,6 +686,138 @@ function SceneGraph.rayMeshUV(
     end
   end
   return bestT, bestU, bestV
+end
+
+-- A CPU triangle soup over the WHOLE scene for triangle-precise picking:
+-- world-space positions (9 numbers per triangle) and the owning glTF node
+-- index (0-based) per triangle.
+export type PickMesh = {
+  positions: { number },
+  triNode: { number },
+  triCount: number,
+}
+
+-- Build the world-space PickMesh of every mesh primitive (all nodes, all
+-- materials). Local POSITION data is read via readAccessorFloats and
+-- transformed by world[nodeIndex]. overridePositions (optional, keyed by
+-- 0-based node index) supplies a flat ALREADY-WORLD-SPACE position array
+-- indexed exactly like the primitive's POSITION accessor (count*3 numbers,
+-- e.g. skinned or morphed vertices); when present for a node it is used
+-- verbatim, with no further transform.
+function SceneGraph.buildPickMesh(
+  glb: GLBData,
+  world: { [number]: Mat },
+  overridePositions: { [number]: { number } }?
+): PickMesh
+  local nodes: { GLBParser.Node } = glb.nodes or {}
+  local positions: { number } = {}
+  local triNode: { number } = {}
+  local triCount = 0
+  for idx = 0, #nodes - 1 do
+    local node = nodes[idx + 1]
+    local w = world[idx]
+    local meshIdx = node.mesh
+    if meshIdx ~= nil and w then
+      local mesh = glb.meshes[meshIdx + 1]
+      if mesh then
+        local override = if overridePositions
+          then overridePositions[idx]
+          else nil
+        for _, prim in ipairs(mesh.primitives) do
+          local posIdx = prim.attributes.POSITION
+          if posIdx ~= nil then
+            local pos = override
+              or GLBParser.readAccessorFloats(glb, posIdx + 1)
+            if pos then
+              local p = pos :: { number }
+              local indices: { number }
+              local idxAcc = prim.indices
+              if idxAcc ~= nil then
+                indices = GLBParser.readIndices(glb, idxAcc + 1) or {}
+              else
+                indices = {}
+                for i = 0, math.floor(#p / 3) - 1 do
+                  indices[i + 1] = i
+                end
+              end
+              for t = 0, math.floor(#indices / 3) - 1 do
+                for k = 1, 3 do
+                  local vi = indices[t * 3 + k]
+                  local wx, wy, wz
+                  if override then
+                    -- already world space
+                    wx, wy, wz =
+                      p[vi * 3 + 1], p[vi * 3 + 2], p[vi * 3 + 3]
+                  else
+                    wx, wy, wz = M3.transformPoint(
+                      w,
+                      p[vi * 3 + 1],
+                      p[vi * 3 + 2],
+                      p[vi * 3 + 3]
+                    )
+                  end
+                  table.insert(positions, wx)
+                  table.insert(positions, wy)
+                  table.insert(positions, wz)
+                end
+                triCount += 1
+                triNode[triCount] = idx
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+  return { positions = positions, triNode = triNode, triCount = triCount }
+end
+
+-- Ray / PickMesh intersection (Moller-Trumbore over every triangle).
+-- Returns (t, nodeIndex) for the NEAREST hit, where nodeIndex is the 0-based
+-- glTF node owning the hit triangle -- or (nil, -1) when nothing is hit.
+function SceneGraph.rayPickMesh(
+  mesh: PickMesh,
+  ox: number, oy: number, oz: number,
+  dx: number, dy: number, dz: number
+): (number?, number)
+  local P = mesh.positions
+  local bestT: number? = nil
+  local bestNode = -1
+  for tri = 0, mesh.triCount - 1 do
+    local p = tri * 9
+    local ax, ay, az = P[p + 1], P[p + 2], P[p + 3]
+    local e1x = P[p + 4] - ax
+    local e1y = P[p + 5] - ay
+    local e1z = P[p + 6] - az
+    local e2x = P[p + 7] - ax
+    local e2y = P[p + 8] - ay
+    local e2z = P[p + 9] - az
+    -- h = d x e2
+    local hx = dy * e2z - dz * e2y
+    local hy = dz * e2x - dx * e2z
+    local hz = dx * e2y - dy * e2x
+    local det = e1x * hx + e1y * hy + e1z * hz
+    if math.abs(det) > 1e-12 then
+      local inv = 1 / det
+      local sx, sy, sz = ox - ax, oy - ay, oz - az
+      local bu = (sx * hx + sy * hy + sz * hz) * inv
+      if bu >= 0 and bu <= 1 then
+        -- q = s x e1
+        local qx = sy * e1z - sz * e1y
+        local qy = sz * e1x - sx * e1z
+        local qz = sx * e1y - sy * e1x
+        local bv = (dx * qx + dy * qy + dz * qz) * inv
+        if bv >= 0 and bu + bv <= 1 then
+          local t = (e2x * qx + e2y * qy + e2z * qz) * inv
+          if t > 1e-6 and (bestT == nil or t < bestT :: number) then
+            bestT = t
+            bestNode = mesh.triNode[tri + 1]
+          end
+        end
+      end
+    end
+  end
+  return bestT, bestNode
 end
 
 return SceneGraph

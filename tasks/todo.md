@@ -38,5 +38,54 @@ analyse stricte, compile checks; chemins runtime Rive gardés par pcall).
 - Le WGSL original n'est pas dans le repo: shaders/model.wgsl est une
   reconstruction du contrat documenté dans GLBModel (offsets UBO, slots,
   vertex layout) -- la PR le signale et l'apparence peut bouger légèrement.
-- wgsl_reflect (npm) valide syntaxe + layout des bindings hors GPU.
+- naga (wgpu) valide syntaxe + layouts des deux modules WGSL hors GPU.
 - Les chemins exécutables uniquement dans Rive restent gardés par pcall.
+- Décodage à l'import (parse), pas de dépendance externe: tout en pur Luau (buffer + bit32).
+- meshopt: bufferViews décodés stockés dans glb.viewData[index]; les lecteurs passent par viewSource().
+- Draco: décode → tableaux plats par accessor (glb.accessorOverrides), pas de re-packing binaire.
+- WebP: on tente context:decodeImage (le runtime Rive peut savoir décoder WebP), sinon décodeur Luau.
+- KTX2: transcodage CPU vers rgba8unorm puis upload direct (pas de formats GPU compressés exposés).
+- En plus (nécessaire pour un rendu correct des fichiers gltfpack): accessors
+  `normalized` (KHR_mesh_quantization) convertis dans readAccessorFloats, et
+  KHR_texture_transform parsé puis baké dans les UV par GLTFMesh.
+
+## Review
+
+Tous les décodeurs sont validés byte-exact contre les implémentations de
+référence, via un harnais luau CLI (fixtures base64) :
+
+- meshopt: 51/51 comparaisons d'accessors exactes sur gltfpack -c/-cc, flux
+  bruts v0+v1 byte-exact (filtres à 1 LSB près du chemin SIMD wasm, conformes
+  au chemin scalaire C de référence).
+- Draco: 57/57 exactes sur gltf-transform (edgebreaker standard, valence,
+  séquentiel) + fixtures unitaires multi-attributs avec seams UV; 60 vecteurs
+  rabs.
+- zstd: 10/10 byte-exact (niveaux 1/3/19, huffman 255 poids, payload UASTC réel).
+- KTX2: ETC1S et UASTC byte-exact vs transcodeur basis officiel, avec et sans
+  tranche alpha; UASTC supercompressé zstd inclus.
+- WebP: 10/10 byte-exact vs sharp/libwebp (lossy q30–q95, alpha, lossless
+  photo/palette, dimensions impaires, 320x200).
+- Bout-en-bout: starship.glb complet compressé gltfpack -cc -tc (meshopt +
+  ETC1S 4096²) parse en ~26 ms; géométrie identique à la référence; mixed
+  draco+ktx2 OK. ETC1S 4096² ≈ 1.5–2.3 s/texture (CPU, niveau 0 seulement).
+- luau-analyze sans erreur sur les 9 modules (mode strict).
+
+# Geometry extensions: cameras, morph targets, pick mesh, glTF projections
+
+Branch agent-a-geometry.
+
+- [x] GLBParser: glTF cameras (flattened Camera type, GLBData.cameras, Node.camera)
+- [x] GLBParser: morph targets (Primitive.targets, Mesh.weights, Node.weights)
+- [x] GLBParser: material extension factors (clearcoat, transmission, sheen, specular, ior)
+- [x] GLBParser fix: accessor.bufferView keeps nil (was `or 0`), so sparse-only
+      accessors (zero base) no longer alias bufferView 0 -- required for sparse
+      morph deltas; Draco accessors unaffected (overrides short-circuit first)
+- [x] SceneGraph: sampleClip second return = per-node morph weights
+      (LINEAR/STEP/CUBICSPLINE), first return unchanged
+- [x] SceneGraph: applyMorphs (base + sum w_i * delta_i, POSITION/NORMAL)
+- [x] SceneGraph: PickMesh / buildPickMesh / rayPickMesh (triangle-precise,
+      per-triangle node id, optional world-space position overrides)
+- [x] Math3D: perspectiveGltfReverseZ (zfar nil = infinite far), orthographicReverseZ
+- [x] Tests in /tmp/t/luau_A: hand-built fixture GLB (sparse morph target,
+      weights anims, cameras, extension materials); 145 checks + full
+      regression suite green; luau-analyze clean on all touched modules
