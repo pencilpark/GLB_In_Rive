@@ -313,6 +313,78 @@ function Math3D.perspectiveReverseZ(
   }
 end
 
+-- Reverse-Z perspective from glTF camera.perspective parameters. Same
+-- convention as perspectiveReverseZ (right-handed, looks down -Z, NDC depth
+-- znear -> 1, zfar -> 0). zfar = nil means an infinite far plane: the limit of
+-- the finite formula as zfar -> inf gives m[11] = 0 and m[15] = znear, so
+-- depth still starts at 1 on the near plane and tends to 0 at infinity.
+function Math3D.perspectiveGltfReverseZ(
+  yfov: number,
+  aspect: number,
+  znear: number,
+  zfar: number?
+): Mat
+  local f = 1 / math.tan(yfov / 2)
+  local m22: number
+  local m32: number
+  if zfar then
+    local nf = 1 / (zfar - znear)
+    m22 = znear * nf
+    m32 = zfar * znear * nf
+  else
+    m22 = 0
+    m32 = znear
+  end
+  return {
+    f / aspect,
+    0,
+    0,
+    0,
+    0,
+    f,
+    0,
+    0,
+    0,
+    0,
+    m22,
+    -1,
+    0,
+    0,
+    m32,
+    0,
+  }
+end
+
+-- Reverse-Z orthographic from glTF camera.orthographic parameters (xmag/ymag
+-- are the half horizontal/vertical extents). Same depth convention as the
+-- reverse-Z perspectives: znear -> 1, zfar -> 0, w stays 1 (no divide).
+function Math3D.orthographicReverseZ(
+  xmag: number,
+  ymag: number,
+  znear: number,
+  zfar: number
+): Mat
+  local nf = 1 / (zfar - znear)
+  return {
+    1 / xmag,
+    0,
+    0,
+    0,
+    0,
+    1 / ymag,
+    0,
+    0,
+    0,
+    0,
+    nf, -- z scale: maps z = -znear -> 1, z = -zfar -> 0 with the offset below
+    0,
+    0,
+    0,
+    zfar * nf,
+    1,
+  }
+end
+
 function Math3D.orbitView(
   tx: number,
   ty: number,
