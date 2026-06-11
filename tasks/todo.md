@@ -1,52 +1,42 @@
-# Support Draco / meshopt / Basis-KTX2 / WebP en pur Luau
+# Couverture intégrale interactif design (PR #4)
 
-Problème: GLBParser bloquait les GLB compressés (KHR_draco_mesh_compression,
-EXT_meshopt_compression, KHR_texture_basisu, EXT_texture_webp). Les outils de
-compression (gltfpack, gltf-transform, export Blender) produisaient des GLB
-inutilisables dans Rive. Objectif: décoder les 4 formats en pur Luau.
+Objectif: couvrir la liste de manques identifiée (interaction, rendu, shaders,
+données) avec livrables fiables (tests CLI byte/valeur-exacts quand possible,
+analyse stricte, compile checks; chemins runtime Rive gardés par pcall).
 
-## Plan
+## Phases
 
-- [x] 1. Environnement de test: luau CLI + gltf-transform + gltfpack + fixtures
-- [x] 2. MeshoptDecoder.luau (EXT_meshopt_compression: index codec, vertex codec v0/v1, filtres oct/quat/exp)
-- [x] 3. Intégration meshopt dans GLBParser (bufferViews décodés à la volée) + test vs gltfpack
-- [x] 4. DracoDecoder.luau (rANS, edgebreaker standard+valence, séquentiel, prédictions, déquantification)
-- [x] 5. Intégration Draco dans GLBParser (overrides d'accessors par primitive) + test vs gltf-transform/Blender
-- [x] 6. ZstdDecoder.luau (RFC 8878: FSE, huffman, séquences) — requis pour KTX2/UASTC
-- [x] 7. KTX2Decoder.luau (conteneur KTX2, BasisLZ→ETC1S→RGBA, UASTC→RGBA, zstd)
-- [x] 8. WebPDecoder.luau (VP8L lossless, VP8 lossy intra, canal alpha) — fallback si decodeImage natif échoue
-- [x] 9. Intégration textures dans GLBModel (KTX2/WebP → upload GPUTexture direct)
-- [x] 10. Tests bout-en-bout: GLB compressés par gltfpack/gltf-transform décodés = référence (PSNR / exact)
-- [x] 11. README + commit + push + PR draft
+- [ ] P0 Doc API (mips/cube/aniso/compare/triggers) -- FAIT, tout est exposé
+- [ ] P1a Agent A: GLBParser (caméras, morph targets, weights anim, factors
+      clearcoat/transmission/sheen/specular/ior) + SceneGraph (pick mesh
+      triangle-précis avec node par triangle, morph/skin aware, sampleClip
+      weights) + Math3D (proj caméra glTF) + tests CLI
+- [ ] P1b Agent B: TextureOps.luau (chaîne de mips box-filter, préfiltrage
+      env progressif, helpers rgba) + tests CLI
+- [ ] P2 Shader WGSL complet (contrat existant reconstruit depuis GLBModel +
+      IBL équirect préfiltrée, ombres dir. PCF (depth packé), clearcoat/
+      sheen/transmission approx, modes unlit/toon/wireframe, alphaCutoff) +
+      entry points shadow + post (bloom/vignette/grade/DOF alpha-depth) +
+      validation wgsl_reflect (layout des bind groups == Luau)
+- [ ] P3 GLBModel integration (un seul rédacteur = session principale):
+      - picking triangle-précis + picking sur pose animée/skinnée
+      - sélection entrante (propriété Number + listener), triggers sortants
+      - caméra UX: pinch zoom, pan 2 doigts, inertie, limites orbit,
+        zoom-sur-partie
+      - mips à l'upload (KTX2 tous niveaux + chaîne CPU pour PNG/WebP),
+        sampler trilinéaire + aniso (feature-gated)
+      - IBL: texture env (blob) préfiltrée CPU + gradient procédural fallback
+      - ombre directionnelle light1 (passe depth-only + depthBias)
+      - tri de transparence back-to-front + alphaCutoff MASK
+      - component-texture multi-slots (A/B/C)
+      - caméras GLB (cameraIndex) + morph targets branchés
+      - post FX: scène offscreen + passe plein écran
+- [ ] P4 README + suite complète + PR draft
 
-## Décisions
+## Notes de fiabilité
 
-- Décodage à l'import (parse), pas de dépendance externe: tout en pur Luau (buffer + bit32).
-- meshopt: bufferViews décodés stockés dans glb.viewData[index]; les lecteurs passent par viewSource().
-- Draco: décode → tableaux plats par accessor (glb.accessorOverrides), pas de re-packing binaire.
-- WebP: on tente context:decodeImage (le runtime Rive peut savoir décoder WebP), sinon décodeur Luau.
-- KTX2: transcodage CPU vers rgba8unorm puis upload direct (pas de formats GPU compressés exposés).
-- En plus (nécessaire pour un rendu correct des fichiers gltfpack): accessors
-  `normalized` (KHR_mesh_quantization) convertis dans readAccessorFloats, et
-  KHR_texture_transform parsé puis baké dans les UV par GLTFMesh.
-
-## Review
-
-Tous les décodeurs sont validés byte-exact contre les implémentations de
-référence, via un harnais luau CLI (fixtures base64) :
-
-- meshopt: 51/51 comparaisons d'accessors exactes sur gltfpack -c/-cc, flux
-  bruts v0+v1 byte-exact (filtres à 1 LSB près du chemin SIMD wasm, conformes
-  au chemin scalaire C de référence).
-- Draco: 57/57 exactes sur gltf-transform (edgebreaker standard, valence,
-  séquentiel) + fixtures unitaires multi-attributs avec seams UV; 60 vecteurs
-  rabs.
-- zstd: 10/10 byte-exact (niveaux 1/3/19, huffman 255 poids, payload UASTC réel).
-- KTX2: ETC1S et UASTC byte-exact vs transcodeur basis officiel, avec et sans
-  tranche alpha; UASTC supercompressé zstd inclus.
-- WebP: 10/10 byte-exact vs sharp/libwebp (lossy q30–q95, alpha, lossless
-  photo/palette, dimensions impaires, 320x200).
-- Bout-en-bout: starship.glb complet compressé gltfpack -cc -tc (meshopt +
-  ETC1S 4096²) parse en ~26 ms; géométrie identique à la référence; mixed
-  draco+ktx2 OK. ETC1S 4096² ≈ 1.5–2.3 s/texture (CPU, niveau 0 seulement).
-- luau-analyze sans erreur sur les 9 modules (mode strict).
+- Le WGSL original n'est pas dans le repo: shaders/model.wgsl est une
+  reconstruction du contrat documenté dans GLBModel (offsets UBO, slots,
+  vertex layout) -- la PR le signale et l'apparence peut bouger légèrement.
+- wgsl_reflect (npm) valide syntaxe + layout des bindings hors GPU.
+- Les chemins exécutables uniquement dans Rive restent gardés par pcall.
