@@ -6,32 +6,48 @@ analyse stricte, compile checks; chemins runtime Rive gardés par pcall).
 
 ## Phases
 
-- [ ] P0 Doc API (mips/cube/aniso/compare/triggers) -- FAIT, tout est exposé
-- [ ] P1a Agent A: GLBParser (caméras, morph targets, weights anim, factors
+- [x] P0 Doc API (mips/cube/aniso/compare/triggers) -- tout est exposé
+- [x] P1a Agent A: GLBParser (caméras, morph targets, weights anim, factors
       clearcoat/transmission/sheen/specular/ior) + SceneGraph (pick mesh
       triangle-précis avec node par triangle, morph/skin aware, sampleClip
-      weights) + Math3D (proj caméra glTF) + tests CLI
-- [ ] P1b Agent B: TextureOps.luau (chaîne de mips box-filter, préfiltrage
+      weights) + Math3D (proj caméra glTF) + tests CLI (145 checks)
+- [x] P1b Agent B: TextureOps.luau (chaîne de mips box-filter, préfiltrage
       env progressif, helpers rgba) + tests CLI
-- [ ] P2 Shader WGSL complet (contrat existant reconstruit depuis GLBModel +
+- [x] P2 Shader WGSL complet (contrat existant reconstruit depuis GLBModel +
       IBL équirect préfiltrée, ombres dir. PCF (depth packé), clearcoat/
       sheen/transmission approx, modes unlit/toon/wireframe, alphaCutoff) +
-      entry points shadow + post (bloom/vignette/grade/DOF alpha-depth) +
-      validation wgsl_reflect (layout des bind groups == Luau)
-- [ ] P3 GLBModel integration (un seul rédacteur = session principale):
-      - picking triangle-précis + picking sur pose animée/skinnée
-      - sélection entrante (propriété Number + listener), triggers sortants
-      - caméra UX: pinch zoom, pan 2 doigts, inertie, limites orbit,
-        zoom-sur-partie
-      - mips à l'upload (KTX2 tous niveaux + chaîne CPU pour PNG/WebP),
-        sampler trilinéaire + aniso (feature-gated)
-      - IBL: texture env (blob) préfiltrée CPU + gradient procédural fallback
-      - ombre directionnelle light1 (passe depth-only + depthBias)
-      - tri de transparence back-to-front + alphaCutoff MASK
-      - component-texture multi-slots (A/B/C)
-      - caméras GLB (cameraIndex) + morph targets branchés
-      - post FX: scène offscreen + passe plein écran
-- [ ] P4 README + suite complète + PR draft
+      entry points shadow + module post séparé (bloom/vignette/grade/DOF
+      alpha-depth) + validation naga (les deux modules)
+- [x] P3 GLBModel integration (un seul rédacteur = session principale):
+      - [x] picking triangle-précis + pose animée/skinnée/morphée
+            (pickPrecise, cache par animationIndex:animTime, overrides par
+            node single-prim; fallback AABB)
+      - [x] sélection entrante (selectPropName + listener, anti-écho),
+            triggers sortants (pickTriggerName/hoverTriggerName + fallback
+            compteur Number)
+      - [x] caméra UX: pinch zoom (zoomMin/zoomMax), pan 2 doigts (centroïde
+            -> offsets monde via colonnes camWorld), inertie (flick + decay),
+            limites pitchMin/pitchMax, focusOnSelect (glide exponentiel)
+      - [x] mips à l'upload (chaîne CPU TextureOps pour tous les décodés) +
+            sampler trilinéaire + aniso si features().anisotropicFiltering
+      - [x] IBL: blob equirect préfiltré CPU (7 niveaux) + gradient
+            sky/horizon/ground fallback (envMode)
+      - [x] ombre directionnelle light1: passe vs_shadow/fs_shadow depth
+            packé rgba8, ortho fitté sur la sphère du modèle, PCF 5 taps,
+            bind group frame séparé (dummy shadow tex)
+      - [x] tri de transparence: alphaMode BLEND -> pipeline blend (depth
+            write off) trié back-to-front; MASK cutoff dans le shader
+      - [x] component-texture slots A/B/C (forward au plus proche hit)
+      - [x] caméras GLB (cameraIndex, perspective + ortho reverse-Z, suit la
+            pose animée) + morph targets (non-skinné: réécriture pos/normal
+            in-place; skinné: morph puis skin)
+      - [x] post FX: scène offscreen (+ resolve MSAA dedans), bright/blurH/
+            blurV/composite, DOF par profondeur en alpha, pcall + désactivation
+            propre en cas d'échec
+      - frame UBO 352 -> 512 (env0, sky/horizon/ground, shadow0, lightVP,
+        mode0); records étendus (alphaCutoff, clearcoat, ext1, sheenColor)
+- [x] P4 README + suite complète (run_all + geomext + textureops + analyze
+      10 modules + compile GLBModel) + PR draft
 
 ## Notes de fiabilité
 

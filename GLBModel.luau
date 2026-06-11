@@ -16,6 +16,7 @@ local Math3D = require('Math3D')
 local SceneGraph = require('SceneGraph')
 local KTX2Decoder = require('KTX2Decoder')
 local WebPDecoder = require('WebPDecoder')
+local TextureOps = require('TextureOps')
 
 -- ---------------------------------------------------------------------------
 -- GPU API shims (type-checker only).
@@ -58,8 +59,14 @@ local STRIDE = 256
 --   misc @192, texControl @208, replaceColor @224,
 --   lights[3] @240 (each Light = dir vec4 + color vec4 = 32 bytes):
 --     light0 @240/@256, light1 @272/@288, light2 @304/@320,
---   hilite @336 (.rgb highlight colour, .w strength)  -> ends at 352.
-local FRAME_SIZE = 352
+--   hilite @336 (.rgb highlight colour, .w strength),
+--   env0 @352 (intensity, maxLod, yaw, mode), skyColor @368,
+--   horizonColor @384, groundColor @400,
+--   shadow0 @416 (strength, bias, mapSize, pcfRadius), lightVP @432,
+--   mode0 @496 (shadingMode, toonSteps, wireWidth, dofDepth) -> ends at 512.
+local FRAME_SIZE = 512
+-- Post uniform block (shaders/post.wgsl `Post` struct): 5 x vec4.
+local POST_SIZE = 80
 
 type SkinRT = {
   data: GLTFMesh.SkinData,
@@ -77,6 +84,26 @@ type DrawGPU = {
   nodeIndex: number, -- for animation
   materialIndex: number?,
   skin: SkinRT?, -- present only for skinned primitives (CPU skinning)
+  skinnedPos: { number }?, -- last world-space skinned positions (pick mesh)
+  blended: boolean, -- material alphaMode == BLEND (drawn sorted, no depth write)
+  viewDepth: number, -- scratch: view-space z used for back-to-front sorting
+  -- morph targets (CPU, like skinning): kept only when the primitive has them
+  prim: GLBParser.Primitive?,
+  morphBuf: buffer?, -- interleaved buffer whose pos/normal lanes are rewritten
+  lastWeightsKey: string, -- skip rewrites when the weights did not change
+}
+
+-- One component-as-texture slot (A/B/C): a live nested artboard rendered
+-- offscreen and bound as the base-colour texture of one material.
+type CompSlot = {
+  instance: any, -- Artboard instance (advanced + drawn every frame)
+  canvas: any, -- offscreen vector Canvas
+  texture: GPUTexture?, -- GPU texture refreshed from canvas.image
+  matBound: number, -- material index currently bound
+  mesh: SceneGraph.TriMesh?, -- triangles of that material (UV ray casting)
+  bounds: { number }, -- artboard bounds {x, y, w, h} cached each frame
+  pointerInside: boolean, -- to emit pointerExit when the ray leaves
+  slot: number, -- 1 = A, 2 = B, 3 = C (for log messages / input lookup)
 }
 
 -- A pickable "part" of the model: one drawable node. Groups every per-object
@@ -147,6 +174,62 @@ type Model = {
   bgAlpha: Input<number>, -- 0 = transparent background
 
   -- ======================================================================
+  -- SHADING MODE
+  -- ======================================================================
+  shadingMode: Input<number>, -- 0 PBR, 1 unlit, 2 toon, 3 wireframe (3 is read at init)
+  toonSteps: Input<number>, -- light quantisation bands in toon mode
+  wireWidth: Input<number>, -- wireframe line width (pixels)
+
+  -- ======================================================================
+  -- ENVIRONMENT / IBL -- image-based ambient + reflections.
+  -- With envName set to an equirectangular panorama blob (PNG/JPEG/WebP/KTX2),
+  -- the model is lit by the image (rough surfaces sample blurred mips).
+  -- Without it, a procedural sky/horizon/ground gradient is used.
+  -- ======================================================================
+  envName: Input<string>, -- equirect panorama blob asset name ('' = gradient)
+  envIntensity: Input<number>, -- % strength of the environment light
+  envYaw: Input<number>, -- rotate the environment around Y (degrees)
+  skyColor: Input<Color>, -- gradient: colour straight up
+  horizonColor: Input<Color>, -- gradient: colour at the horizon
+  groundColor: Input<Color>, -- gradient: colour straight down
+
+  -- ======================================================================
+  -- SHADOW -- light 1 (key) casts a soft directional shadow.
+  -- ======================================================================
+  shadowEnabled: Input<boolean>, -- allocate the shadow map (read at init)
+  shadowSize: Input<number>, -- shadow map resolution (read at init)
+  shadowStrength: Input<number>, -- % darkness; 0 disables the pass
+  shadowBias: Input<number>, -- depth bias (raise on acne, lower on peter-panning)
+  shadowSoftness: Input<number>, -- PCF blur radius in shadow-map texels
+
+  -- ======================================================================
+  -- POST FX -- offscreen scene + fullscreen passes (needs the 'post' WGSL
+  -- asset). postEnabled is read at init; the individual effects are live.
+  -- ======================================================================
+  postEnabled: Input<boolean>,
+  postShaderName: Input<string>, -- WGSL Shader asset with the post passes
+  bloomEnabled: Input<boolean>,
+  bloomThreshold: Input<number>, -- luminance where glow starts (0..1)
+  bloomIntensity: Input<number>,
+  vignetteAmount: Input<number>, -- 0 = off
+  vignetteRadius: Input<number>, -- 0..1: where darkening starts from centre
+  vignetteSoftness: Input<number>,
+  gradeEnabled: Input<boolean>,
+  gradeExposure: Input<number>,
+  gradeContrast: Input<number>,
+  gradeSaturation: Input<number>,
+  dofEnabled: Input<boolean>, -- depth of field (opaque scenes, alphaBlend off)
+  dofAutoFocus: Input<boolean>, -- keep the model centre in focus
+  dofFocus: Input<number>, -- manual focus depth (0..1 of the far plane)
+  dofRange: Input<number>, -- in-focus range (0..1 of the far plane)
+  dofRadius: Input<number>, -- max blur radius (pixels)
+
+  -- ======================================================================
+  -- GLB CAMERA -- render through a camera authored in the file.
+  -- ======================================================================
+  cameraIndex: Input<number>, -- -1 = orbit camera, >= 0 = GLB camera index
+
+  -- ======================================================================
   -- MATERIAL overrides (live / keyframeable)
   -- ======================================================================
   tint: Input<Color>, -- multiplies base colour
@@ -183,6 +266,11 @@ type Model = {
   componentMatIndex: Input<number>, -- 0-based material that receives the live texture
   componentSize: Input<number>, -- offscreen resolution in pixels (square)
   componentInteractive: Input<boolean>, -- forward pointer events via UV ray casting
+  -- Two more independent slots (B/C); same size/interactive settings as A.
+  componentArtboardB: Input<Artboard<nil>>,
+  componentMatIndexB: Input<number>,
+  componentArtboardC: Input<Artboard<nil>>,
+  componentMatIndexC: Input<number>,
 
   -- ======================================================================
   -- ANIMATION (live / keyframeable)
@@ -204,13 +292,29 @@ type Model = {
   hoverHighlight: Input<boolean>, -- true -> highlight the part under the pointer on move
   highlightColor: Input<Color>, -- colour used to highlight the hovered/selected part
   highlightStrength: Input<number>, -- 0..1 blend strength of the highlight
+  pickPrecise: Input<boolean>, -- true -> triangle-accurate picking (follows the
+  -- animated pose); false -> fast per-part AABB test
+  selectPropName: Input<string>, -- ViewModel Number property: write a glTF node
+  -- index into it (from data/another script) to select that part from outside
+  pickTriggerName: Input<string>, -- ViewModel Trigger fired when a part is picked
+  hoverTriggerName: Input<string>, -- ViewModel Trigger fired when the hovered part changes
+
+  -- camera UX (touch: pinch zoom + two-finger pan; release flick = inertia)
+  pitchMin: Input<number>, -- orbit limit (degrees)
+  pitchMax: Input<number>,
+  zoomMin: Input<number>, -- pinch zoom clamp (multiplier on the fitted distance)
+  zoomMax: Input<number>,
+  inertia: Input<number>, -- 0 = stop dead on release .. 1 = long glide
+  focusOnSelect: Input<boolean>, -- glide the camera onto the picked part
 
   gpu: GPUCanvas?,
   depth: GPUTexture?,
   msaaColor: GPUTexture?,
-  pipeline: GPUPipeline?,
+  pipeline: GPUPipeline?, -- opaque draws (depth write on)
+  pipelineBlend: GPUPipeline?, -- BLEND draws (premultiplied, depth write off)
   sampler: ImageSampler?,
   gpuSampler: GPUSampler?,
+  layout0: GPUBindGroupLayout?,
   layout1: GPUBindGroupLayout?,
   frameBuf: GPUBuffer?,
   frameBind: GPUBindGroup?,
@@ -218,6 +322,45 @@ type Model = {
   objBytes: buffer?,
   matBinds: { GPUBindGroup },
   fallbackBind: GPUBindGroup?,
+
+  -- shadow pass
+  shadowTex: GPUTexture?, -- rgba8-packed depth from the light
+  shadowDepthTex: GPUTexture?,
+  shadowPipeline: GPUPipeline?,
+  frameBindShadow: GPUBindGroup?, -- frame bind with a dummy shadow texture
+  clampSampler: GPUSampler?,
+
+  -- environment (IBL)
+  envTexture: GPUTexture?,
+  envSampler: GPUSampler?,
+  envMaxLod: number,
+  envMode: number, -- 0 = gradient, 1 = equirect texture
+
+  -- post fx
+  sceneTex: GPUTexture?, -- offscreen scene colour (post enabled only)
+  brightTex: GPUTexture?, -- half-res bloom chain
+  blurTexA: GPUTexture?,
+  blurTexB: GPUTexture?,
+  fsIbo: GPUBuffer?, -- {0,1,2} index buffer for fullscreen triangles
+  postBufBright: GPUBuffer?,
+  postBufBlurH: GPUBuffer?,
+  postBufBlurV: GPUBuffer?,
+  postBufComposite: GPUBuffer?,
+  postPipeBright: GPUPipeline?,
+  postPipeBlur: GPUPipeline?,
+  postPipeComposite: GPUPipeline?,
+  postBindBright: GPUBindGroup?,
+  postBindBlurH: GPUBindGroup?,
+  postBindBlurV: GPUBindGroup?,
+  postBindComposite: GPUBindGroup?,
+  postActive: boolean,
+
+  -- camera bookkeeping (written by updateCamera, read by picking/post/sorting)
+  viewMat: { number }?, -- final view matrix (with roll)
+  far: number, -- far plane of the last projection
+  dofFocusAuto: number, -- model-centre depth (0..1 of far)
+  lastDist: number, -- camera distance (world units, for pan scaling)
+  shadowMapSize: number, -- resolution the shadow map was allocated at
 
   -- texture system (kept so async decodes can rebuild the binds)
   context: Context?,
@@ -242,18 +385,15 @@ type Model = {
   animDuration: number,
   animTime: number,
 
-  -- component-as-texture state
-  compInstance: any, -- Artboard instance (advanced + drawn every frame)
-  compCanvas: any, -- offscreen vector Canvas
-  compTexture: GPUTexture?, -- GPU texture refreshed from compCanvas.image
-  compMatBound: number, -- material index currently bound (-1 = none)
-  compMesh: SceneGraph.TriMesh?, -- world-space triangles of that material (UV ray casting)
-  compBounds: { number }, -- artboard bounds {x, y, w, h} cached each frame
-  compPointerInside: boolean, -- to emit pointerExit when the ray leaves the part
+  -- component-as-texture state (slots A/B/C)
+  compSlots: { CompSlot },
 
   -- interactivity / picking state
   parts: { Part }, -- one entry per drawable node
   partAABBs: { SceneGraph.AABB? }, -- world-space AABB per part (index matches parts)
+  nodeToPartIdx: { [number]: number }, -- glTF node index -> 1-based part index
+  pickMesh: SceneGraph.PickMesh?, -- triangle-accurate pick mesh (current pose)
+  pickMeshKey: string, -- animationIndex:animTime the pick mesh was built at
   camWorld: { number }?, -- camera world matrix (inverse view) for ray picking
   fovYRad: number, -- last vertical fov used (radians) for ray picking
   dragYaw: number, -- accumulated drag offset added to yaw (degrees)
@@ -266,6 +406,31 @@ type Model = {
   pickProp: any, -- Property<string> for the picked part name (kept alive)
   pickIndexProp: any, -- Property<number> for the picked part index (kept alive)
   pickNodeProp: any, -- Property<number> for the picked part's glTF node index (kept alive)
+  selectProp: any, -- Property<number> for inbound selection (kept alive)
+
+  -- multi-pointer gestures + inertia + focus glide
+  activePointers: { [number]: { number } }, -- pointer id -> {x, y}
+  pinching: boolean,
+  pinchBaseDist: number,
+  pinchBaseZoom: number,
+  pinchLastCX: number,
+  pinchLastCY: number,
+  zoom: number, -- pinch zoom multiplier (1 = the fitted distance)
+  panOffX: number, -- two-finger pan offset (world units)
+  panOffY: number,
+  panOffZ: number,
+  velYaw: number, -- flick velocity (deg/s) for inertia
+  velPitch: number,
+  flickDX: number, -- pixels dragged since the last advance()
+  flickDY: number,
+  focusCx: number, -- glided camera target (zoom-to-part)
+  focusCy: number,
+  focusCz: number,
+  focusR: number,
+
+  -- animated pose cache (GLB cameras + accurate picking follow the pose)
+  lastWorld: { [number]: { number } }?, -- node world matrices of the current pose
+
   debug: Input<number>, -- 0 normal, 1 raw base-colour, 2 UVs, 3 metal/rough, 4 emissive
 }
 
@@ -312,6 +477,85 @@ local function packRecord(
     0
   )
   writeVec4(bytes, off + 160, metal, rough, hasTex, 0.5)
+end
+
+-- Per-record material extension factors + alpha mode, packed after the base
+-- record fields (offsets match the WGSL `Obj` struct).
+local function writeMatExtras(
+  bytes: buffer,
+  off: number,
+  mat: GLBParser.Material?
+)
+  local cutoff = if mat then mat.alphaCutoff else 0.5
+  local alphaMode = 0
+  if mat and mat.alphaMode == 'MASK' then
+    alphaMode = 1
+  elseif mat and mat.alphaMode == 'BLEND' then
+    alphaMode = 2
+  end
+  -- mrFlags.w @172: alpha cutoff (MASK)
+  buffer.writef32(bytes, off + 172, cutoff)
+  -- flags4.z/.w @216/220: clearcoat factor + clearcoat roughness
+  buffer.writef32(bytes, off + 216, if mat then mat.clearcoatFactor else 0)
+  buffer.writef32(
+    bytes,
+    off + 220,
+    if mat then mat.clearcoatRoughnessFactor else 0
+  )
+  -- ext1 @224: transmission, ior, sheenRoughness, alphaMode
+  writeVec4(
+    bytes,
+    off + 224,
+    if mat then mat.transmissionFactor else 0,
+    if mat then mat.ior else 1.5,
+    if mat then mat.sheenRoughnessFactor else 0,
+    alphaMode
+  )
+  -- sheenColor @240
+  local sc = if mat then mat.sheenColorFactor else nil
+  writeVec4(
+    bytes,
+    off + 240,
+    if sc then sc[1] or 0 else 0,
+    if sc then sc[2] or 0 else 0,
+    if sc then sc[3] or 0 else 0,
+    0
+  )
+end
+
+-- Wireframe support: rebuild a primitive unindexed with barycentric
+-- coordinates in the COLOR attribute (the shader turns them into lines with
+-- fwidth). Vertex colours are sacrificed in this mode.
+local function expandForWireframe(item: GLTFMesh.DrawItem): GLTFMesh.DrawItem
+  local stride = GLTFMesh.STRIDE
+  local src = item.vertexData
+  local idx = item.indexData
+  local n = item.indexCount
+  local out = buffer.create(n * stride)
+  local u16 = item.indexFormat == 'uint16'
+  for t = 0, n - 1 do
+    local v = if u16 then buffer.readu16(idx, t * 2) else buffer.readu32(idx, t * 4)
+    buffer.copy(out, t * stride, src, v * stride, stride)
+    local lane = t % 3
+    local cOff = t * stride + GLTFMesh.OFF_COLOR
+    buffer.writef32(out, cOff, if lane == 0 then 1 else 0)
+    buffer.writef32(out, cOff + 4, if lane == 1 then 1 else 0)
+    buffer.writef32(out, cOff + 8, if lane == 2 then 1 else 0)
+    buffer.writef32(out, cOff + 12, 1)
+  end
+  local ib = buffer.create(n * 4)
+  for t = 0, n - 1 do
+    buffer.writeu32(ib, t * 4, t)
+  end
+  return {
+    vertexData = out,
+    vertexCount = n,
+    vertexStride = stride,
+    indexData = ib,
+    indexCount = n,
+    indexFormat = 'uint32',
+    materialIndex = item.materialIndex,
+  }
 end
 
 local function makeMatBind(
@@ -487,8 +731,66 @@ local function rebuildMatBinds(self: Model)
   objBuf:write(objBytes, 0)
 end
 
+-- (Re)build the group-0 bind groups: frame UBO + shadow map + environment
+-- texture/samplers. The shadow pass variant binds a dummy white texture in
+-- the shadow slot (a render target can't be sampled while being rendered to).
+-- Falls back to a UBO-only bind group when the loaded shader asset predates
+-- the shadow/IBL bindings, preserving the legacy behaviour.
+local function rebuildFrameBinds(self: Model)
+  local frameBuf, layout0, white = self.frameBuf, self.layout0, self.whiteView
+  if not frameBuf or not layout0 or not white then
+    return
+  end
+  local ubos: { UBOEntry } = {
+    { slot = 0, buffer = frameBuf, offset = 0, size = FRAME_SIZE } :: UBOEntry,
+  }
+  local clampS = self.clampSampler
+  local envS = self.envSampler or clampS
+  local ok = pcall(function()
+    local shadowView = if self.shadowTex
+      then (self.shadowTex :: GPUTexture):view()
+      else white
+    local envView = if self.envTexture
+      then (self.envTexture :: GPUTexture):view()
+      else white
+    self.frameBind = GPUBindGroup.new({
+      layout = layout0,
+      ubos = ubos,
+      textures = {
+        { slot = 1, view = shadowView } :: TextureEntry,
+        { slot = 3, view = envView } :: TextureEntry,
+      },
+      samplers = {
+        { slot = 2, sampler = clampS } :: SamplerEntry,
+        { slot = 4, sampler = envS } :: SamplerEntry,
+      },
+    })
+    self.frameBindShadow = GPUBindGroup.new({
+      layout = layout0,
+      ubos = ubos,
+      textures = {
+        { slot = 1, view = white } :: TextureEntry,
+        { slot = 3, view = white } :: TextureEntry,
+      },
+      samplers = {
+        { slot = 2, sampler = clampS } :: SamplerEntry,
+        { slot = 4, sampler = envS } :: SamplerEntry,
+      },
+    })
+  end)
+  if not ok then
+    -- legacy 'model' shader asset: group 0 only holds the frame UBO
+    pcall(function()
+      self.frameBind = GPUBindGroup.new({ layout = layout0, ubos = ubos })
+    end)
+    self.frameBindShadow = nil
+  end
+end
+
 -- Upload a decoded RGBA image to a GPUTexture and cache its view for the
--- given glTF image index, then refresh the material binds.
+-- given glTF image index, then refresh the material binds. A CPU box-filter
+-- mip chain is built so minified textures sample cleanly (trilinear); when
+-- the runtime rejects mipmapped textures we fall back to a single level.
 local function uploadDecodedImage(
   self: Model,
   imageIndex: number,
@@ -497,14 +799,38 @@ local function uploadDecodedImage(
   rgba: buffer,
   label: string
 )
-  local tex = GPUTexture.new({
-    width = width,
-    height = height,
-    format = 'rgba8unorm',
-  })
-  tex:upload({ data = rgba })
+  local tex: GPUTexture? = nil
+  pcall(function()
+    local chain = TextureOps.buildMipChain(rgba, width, height)
+    if #chain > 1 then
+      local t = GPUTexture.new({
+        width = width,
+        height = height,
+        format = 'rgba8unorm',
+        mipmaps = #chain,
+      })
+      for i, lvl in ipairs(chain) do
+        t:upload({
+          data = lvl.data,
+          mipLevel = i - 1,
+          width = lvl.width,
+          height = lvl.height,
+        })
+      end
+      tex = t
+    end
+  end)
+  if tex == nil then
+    local t = GPUTexture.new({
+      width = width,
+      height = height,
+      format = 'rgba8unorm',
+    })
+    t:upload({ data = rgba })
+    tex = t
+  end
   table.insert(self.imageTextures, tex) -- keep alive
-  self.imageViews[imageIndex] = tex:view()
+  self.imageViews[imageIndex] = (tex :: GPUTexture):view()
   rebuildMatBinds(self)
   if self.context then
     self.context:markNeedsUpdate()
@@ -646,6 +972,115 @@ local function loadEmbeddedTextures(self: Model, context: Context)
   end
 end
 
+-- Upload a decoded equirect panorama as the IBL environment: prefilter a mip
+-- chain on the CPU (each level blurrier = rougher reflections) and upload
+-- every level, then swap the frame binds over to it.
+local function uploadEnvironment(
+  self: Model,
+  width: number,
+  height: number,
+  rgba: buffer,
+  label: string
+)
+  local ok, err = pcall(function()
+    local chain = TextureOps.prefilterEnvChain(rgba, width, height, 7)
+    local tex = GPUTexture.new({
+      width = width,
+      height = height,
+      format = 'rgba8unorm',
+      mipmaps = #chain,
+    })
+    for i, lvl in ipairs(chain) do
+      tex:upload({
+        data = lvl.data,
+        mipLevel = i - 1,
+        width = lvl.width,
+        height = lvl.height,
+      })
+    end
+    self.envTexture = tex
+    self.envMaxLod = #chain - 1
+    self.envMode = 1
+  end)
+  if not ok then
+    print('[GLBModel.env] environment upload failed: ' .. tostring(err))
+    return
+  end
+  rebuildFrameBinds(self)
+  if self.context then
+    self.context:markNeedsUpdate()
+  end
+  print(
+    string.format(
+      '[GLBModel.env] environment \'%s\' active: %dx%d (%s, %d mip levels)',
+      tostring(self.envName),
+      width,
+      height,
+      label,
+      self.envMaxLod + 1
+    )
+  )
+end
+
+-- Load the equirect environment blob named by envName. KTX2 and WebP decode
+-- through the pure-Luau decoders, everything else through the runtime's
+-- native image decoder. Missing/failed = procedural gradient sky.
+local function loadEnvironment(self: Model, context: Context)
+  self.envMode = 0
+  self.envMaxLod = 0
+  if self.envName == '' then
+    return
+  end
+  local blob = context:blob(self.envName)
+  if not blob then
+    print(
+      '[GLBModel.env] env blob not found: \''
+        .. tostring(self.envName)
+        .. '\' (gradient sky used)'
+    )
+    return
+  end
+  local bytes = blob.data
+  if KTX2Decoder.isKTX2(bytes) then
+    local tex, kerr = KTX2Decoder.decode(bytes)
+    if tex then
+      local t = tex :: KTX2Decoder.DecodedTexture
+      uploadEnvironment(self, t.width, t.height, t.rgba, 'KTX2')
+    else
+      print('[GLBModel.env] KTX2 decode failed: ' .. tostring(kerr))
+    end
+    return
+  end
+  if WebPDecoder.isWebP(bytes) then
+    local img, werr = WebPDecoder.decode(bytes)
+    if img then
+      local m = img :: WebPDecoder.DecodedImage
+      uploadEnvironment(self, m.width, m.height, m.rgba, 'WebP')
+    else
+      print('[GLBModel.env] WebP decode failed: ' .. tostring(werr))
+    end
+    return
+  end
+  local okCall, callErr = pcall(function()
+    (context :: any):decodeImage(bytes):andThen(function(decoded)
+      uploadEnvironment(
+        self,
+        decoded.width,
+        decoded.height,
+        decoded.data,
+        'native'
+      )
+      return nil
+    end, function(err)
+      print('[GLBModel.env] decodeImage failed: ' .. tostring(err))
+      return nil
+    end)
+  end)
+  if not okCall then
+    print('[GLBModel.env] decodeImage call failed: ' .. tostring(callErr))
+  end
+end
+
 -- Inverse bind matrices for a skin, as a list of flat Mats (identity fallback).
 local function readInvBinds(
   glb: GLBParser.GLBData,
@@ -675,7 +1110,7 @@ end
 
 -- Build one DrawGPU per primitive (placed by its node world matrix) + the
 -- packed per-object UBO bytes + bounds + counts + the pickable parts list.
-local function buildDraws(glb: GLBParser.GLBData): (
+local function buildDraws(glb: GLBParser.GLBData, wireframe: boolean): (
   { DrawGPU },
   buffer,
   { number },
@@ -684,7 +1119,8 @@ local function buildDraws(glb: GLBParser.GLBData): (
   number,
   number,
   { Part },
-  { SceneGraph.AABB? }
+  { SceneGraph.AABB? },
+  { [number]: number }
 )
   local world = SceneGraph.computeWorldMatrices(glb)
   local aabb = SceneGraph.computeAABB(glb, world)
@@ -694,6 +1130,8 @@ local function buildDraws(glb: GLBParser.GLBData): (
     node: number,
     w: { number },
     skin: SkinRT?,
+    prim: GLBParser.Primitive,
+    morph: boolean, -- primitive has morph targets we can drive on the CPU
   }
   local list: { Entry } = {}
   for idx = 0, #nodes - 1 do
@@ -718,9 +1156,17 @@ local function buildDraws(glb: GLBParser.GLBData): (
                 }
               end
             end
+            local hasTargets = prim.targets ~= nil and #(prim.targets :: any) > 0
+            local morph = hasTargets
+            if wireframe and skinRT == nil then
+              -- the unindexed rebuild changes the vertex order, so CPU morphs
+              -- can no longer address vertices by accessor index
+              item = expandForWireframe(item)
+              morph = false
+            end
             table.insert(
               list,
-              { item = item, node = idx, w = w, skin = skinRT }
+              { item = item, node = idx, w = w, skin = skinRT, prim = prim, morph = morph }
             )
           end
         end
@@ -752,12 +1198,13 @@ local function buildDraws(glb: GLBParser.GLBData): (
       rough,
       hasTex
     )
+    writeMatExtras(objBytes, (i - 1) * STRIDE, mat)
     table.insert(draws, {
       vbo = GPUBuffer.new({
         size = buffer.len(item.vertexData),
         usage = 'vertex',
         data = item.vertexData,
-        immutable = e.skin == nil,
+        immutable = e.skin == nil and not e.morph,
       }),
       ibo = GPUBuffer.new({
         size = buffer.len(item.indexData),
@@ -771,6 +1218,14 @@ local function buildDraws(glb: GLBParser.GLBData): (
       nodeIndex = e.node,
       materialIndex = item.materialIndex,
       skin = e.skin,
+      blended = mat ~= nil and mat.alphaMode == 'BLEND',
+      viewDepth = 0,
+      prim = if e.morph then e.prim else nil,
+      -- applyMorphs returns complete morphed positions/normals, and morphing
+      -- leaves every other attribute untouched, so the original interleaved
+      -- buffer can be rewritten in place (GPUBuffer.new copied it at upload).
+      morphBuf = if e.morph and e.skin == nil then item.vertexData else nil,
+      lastWeightsKey = '',
     })
     verts += item.vertexCount
     tris += math.floor(item.indexCount / 3)
@@ -816,13 +1271,112 @@ local function buildDraws(glb: GLBParser.GLBData): (
     table.insert(parts[pi].recordIndices, d.recordIndex)
   end
 
-  return draws, objBytes, center, radius, aabb, verts, tris, parts, partAABBs
+  return draws,
+    objBytes,
+    center,
+    radius,
+    aabb,
+    verts,
+    tris,
+    parts,
+    partAABBs,
+    nodeToPart
+end
+
+-- Effective morph weights for a node: animated > node override > mesh default.
+local function nodeWeights(
+  glb: GLBParser.GLBData,
+  nodeIndex: number,
+  animWeights: { [number]: { number } }?
+): { number }?
+  if animWeights then
+    local w = animWeights[nodeIndex]
+    if w then
+      return w
+    end
+  end
+  local nodes = glb.nodes
+  local node = if nodes then nodes[nodeIndex + 1] else nil
+  if node then
+    if node.weights then
+      return node.weights
+    end
+    local meshIdx = node.mesh
+    if meshIdx ~= nil then
+      local mesh = glb.meshes[meshIdx + 1]
+      if mesh and mesh.weights then
+        return mesh.weights
+      end
+    end
+  end
+  return nil
+end
+
+-- CPU morph targets for non-skinned primitives: blend the targets on the CPU
+-- and rewrite the position/normal lanes of the (mutable) vertex buffer.
+-- Skinned primitives morph inside applySkinning instead (morph THEN skin).
+local function applyMorphTargets(
+  self: Model,
+  animWeights: { [number]: { number } }?
+)
+  local glb = self.glb
+  if not glb then
+    return
+  end
+  for _, d in ipairs(self.draws) do
+    local prim, buf = d.prim, d.morphBuf
+    if prim and buf then
+      local weights = nodeWeights(glb, d.nodeIndex, animWeights)
+      if weights then
+        local key = table.concat(weights, ',')
+        if key ~= d.lastWeightsKey then
+          d.lastWeightsKey = key
+          local pos, norm = SceneGraph.applyMorphs(glb, prim, weights)
+          if pos then
+            local stride = GLTFMesh.STRIDE
+            local vcount = math.floor(buffer.len(buf) / stride)
+            local n = math.min(vcount, math.floor(#pos / 3))
+            for v = 0, n - 1 do
+              local b = v * stride + GLTFMesh.OFF_POS
+              buffer.writef32(buf, b, pos[v * 3 + 1])
+              buffer.writef32(buf, b + 4, pos[v * 3 + 2])
+              buffer.writef32(buf, b + 8, pos[v * 3 + 3])
+            end
+            if norm then
+              local m = math.min(vcount, math.floor(#norm / 3))
+              for v = 0, m - 1 do
+                -- renormalise after blending
+                local nx = norm[v * 3 + 1]
+                local ny = norm[v * 3 + 2]
+                local nz = norm[v * 3 + 3]
+                local l = math.sqrt(nx * nx + ny * ny + nz * nz)
+                if l > 1e-6 then
+                  nx, ny, nz = nx / l, ny / l, nz / l
+                end
+                local b = v * stride + GLTFMesh.OFF_NORMAL
+                buffer.writef32(buf, b, nx)
+                buffer.writef32(buf, b + 4, ny)
+                buffer.writef32(buf, b + 8, nz)
+              end
+            end
+            d.vbo:write(buf, 0)
+          end
+        end
+      end
+    end
+  end
 end
 
 -- CPU linear-blend skinning: re-skin each skinned primitive's vertices for the
 -- given world matrices and rewrite its (mutable) vertex buffer. Skinned vertices
 -- come out in world space, so those draws use an identity model matrix.
-local function applySkinning(self: Model, world: { [number]: { number } })
+-- When the primitive also has morph targets, they are applied first (glTF
+-- order: morph, then skin).
+local function applySkinning(
+  self: Model,
+  world: { [number]: { number } },
+  animWeights: { [number]: { number } }?
+)
   local glb = self.glb
   if not glb or not glb.skins then
     return
@@ -837,13 +1391,28 @@ local function applySkinning(self: Model, world: { [number]: { number } })
           jointWorlds[ji] = world[jn] or Math3D.identity()
         end
         local jointMats = SceneGraph.jointMatrices(jointWorlds, s.invBinds, nil)
+        local basePos, baseNorm = s.data.positions, s.data.normals
+        local prim = d.prim
+        if prim then
+          local weights = nodeWeights(glb, d.nodeIndex, animWeights)
+          if weights then
+            local mp, mn = SceneGraph.applyMorphs(glb, prim, weights)
+            if mp then
+              basePos = mp
+            end
+            if mn then
+              baseNorm = mn
+            end
+          end
+        end
         local sp, sn = SceneGraph.skinVertices(
-          s.data.positions,
-          s.data.normals,
+          basePos,
+          baseNorm,
           s.data.joints,
           s.data.weights,
           jointMats
         )
+        d.skinnedPos = sp -- world space; reused by the pick mesh
         -- Skin the tangent xyz the same way as normals (direction transform);
         -- the handedness sign (tangent.w) is preserved from the bind pose.
         local tanXYZ: { number } = {}
@@ -945,6 +1514,88 @@ end
 -- (loadTexture removed: the async decodeImage path crashes the editor on large
 -- textures. Textures now go through texBlob -- a pre-baked RGBA blob -- in init.)
 
+-- Light 1's view-projection for the shadow pass: an ortho frustum fitted
+-- around the model sphere, depth mapped 0 (near) .. 1 (far) to match the
+-- packed-depth comparison in the shader.
+local function lightViewProj(self: Model): { number }
+  local r = math.max(self.radius, 1e-3) * 1.3
+  local dist = r * 3
+  local view = Math3D.orbitCamera(
+    self.center[1],
+    self.center[2],
+    self.center[3],
+    math.rad(self.light1Yaw),
+    -- orbitCamera's pitch lowers the eye; the light direction raises it
+    -math.rad(self.light1Pitch),
+    dist
+  )
+  local near, far = dist - r, dist + r
+  local inv = 1 / (far - near)
+  -- column-major ortho: xy in [-1,1], view depth (-z) mapped to [0,1]
+  local proj = {
+    1 / r, 0, 0, 0,
+    0, 1 / r, 0, 0,
+    0, 0, -inv, 0,
+    0, 0, -near * inv, 1,
+  }
+  return Math3D.multiply(proj, view)
+end
+
+-- Resolve the GLB camera selected by cameraIndex in the current pose.
+-- Returns view, proj, camera world matrix, vertical fov (rad, 0 for ortho)
+-- and the far plane -- or nils when the index/camera/node is unavailable.
+local function glbCamera(
+  self: Model,
+  aspect: number
+): ({ number }?, { number }?, { number }?, number, number)
+  local glb = self.glb
+  local camIdx = math.floor(self.cameraIndex)
+  if not glb or camIdx < 0 then
+    return nil, nil, nil, 0, 0
+  end
+  local cams = glb.cameras
+  local nodes = glb.nodes
+  local world = self.lastWorld
+  if not cams or not nodes or not world then
+    return nil, nil, nil, 0, 0
+  end
+  local cam = cams[camIdx + 1]
+  if not cam then
+    return nil, nil, nil, 0, 0
+  end
+  local nodeWorld: { number }? = nil
+  for idx = 0, #nodes - 1 do
+    if nodes[idx + 1].camera == camIdx then
+      nodeWorld = world[idx]
+      break
+    end
+  end
+  if not nodeWorld then
+    return nil, nil, nil, 0, 0
+  end
+  local view = Math3D.invert(nodeWorld)
+  if not view then
+    return nil, nil, nil, 0, 0
+  end
+  if cam.type == 'orthographic' then
+    local znear = cam.znear or 0.01
+    local zfar = cam.zfar or (znear + self.radius * 10)
+    local proj =
+      Math3D.orthographicReverseZ(cam.xmag or 1, cam.ymag or 1, znear, zfar)
+    return view, proj, nodeWorld, 0, zfar
+  end
+  local yfov = cam.yfov or 1
+  local znear = cam.znear or 0.01
+  local far = cam.zfar or (znear * 100000) -- DOF scaling only
+  local proj = Math3D.perspectiveGltfReverseZ(
+    yfov,
+    cam.aspectRatio or aspect, -- glTF: undefined aspect = use the viewport's
+    znear,
+    cam.zfar
+  )
+  return view, proj, nodeWorld, yfov, far
+end
+
 local function updateCamera(self: Model)
   local gpu, frameBuf = self.gpu, self.frameBuf
   if not gpu or not frameBuf or gpu.width <= 0 or gpu.height <= 0 then
@@ -952,37 +1603,74 @@ local function updateCamera(self: Model)
   end
   local aspect = gpu.width / gpu.height
   local fovY = (math.rad(self.fovY) / 100) + 0.01
-  local cx, cy, cz =
-    self.center[1] + self.panX,
-    self.center[2] + self.panY,
-    self.center[3] + self.panZ
-  local dist = Math3D.fitDistance(self.radius, fovY * 10)
-    * (self.distanceFactor * 0.01)
-  -- Drag offsets (dragYaw/dragPitch) are added on top of the keyframeable
-  -- yaw/pitch inputs only when interactive mode is on, so they survive as a
-  -- keyframeable internal offset and never fight the input values.
-  local extraYaw = if self.interactive then math.rad(self.dragYaw) else 0
-  local extraPitch = if self.interactive then math.rad(self.dragPitch) else 0
-  local yawTotal = math.rad(self.yaw) + self.angle + extraYaw
-  local pitchTotal =
-    math.clamp(math.rad(self.pitch) + extraPitch, -math.rad(89), math.rad(89))
-  local view, ex, ey, ez =
-    Math3D.orbitCamera(cx, cy, cz, yawTotal, pitchTotal, dist)
-  -- Store the camera world matrix (inverse view, pre-roll) + fov for ray picking.
-  self.camWorld = Math3D.invert(view)
-  self.fovYRad = fovY
-  if self.roll ~= 0 then
-    view = Math3D.multiply(Math3D.fromRotationZ(math.rad(self.roll)), view)
+  local view: { number }
+  local proj: { number }
+  local ex: number, ey: number, ez: number
+  local far: number
+
+  local gview, gproj, gworld, gfov, gfar = glbCamera(self, aspect)
+  if gview ~= nil and gproj ~= nil and gworld ~= nil then
+    -- GLB-authored camera: follows its (possibly animated) node. Orbit, pan
+    -- and zoom inputs are ignored while one is active.
+    view, proj = gview, gproj
+    ex, ey, ez = gworld[13], gworld[14], gworld[15]
+    self.camWorld = gworld
+    self.fovYRad = if gfov > 0 then gfov else fovY
+    far = gfar
+    self.lastDist = self.radius * 3
+  else
+    -- Orbit camera around the glided focus target (zoom-to-part) plus the
+    -- keyframeable pan inputs and the two-finger pan offsets.
+    local cx = self.focusCx + self.panX + self.panOffX
+    local cy = self.focusCy + self.panY + self.panOffY
+    local cz = self.focusCz + self.panZ + self.panOffZ
+    local zoomLo = math.max(0.01, math.min(self.zoomMin, self.zoomMax))
+    local zoomHi = math.max(zoomLo, self.zoomMin, self.zoomMax)
+    local zoom = math.clamp(self.zoom, zoomLo, zoomHi)
+    local dist = Math3D.fitDistance(self.focusR, fovY * 10)
+      * (self.distanceFactor * 0.01)
+      * zoom
+    self.lastDist = dist
+    -- Drag offsets (dragYaw/dragPitch) are added on top of the keyframeable
+    -- yaw/pitch inputs only when interactive mode is on, so they survive as a
+    -- keyframeable internal offset and never fight the input values.
+    local extraYaw = if self.interactive then math.rad(self.dragYaw) else 0
+    local extraPitch = if self.interactive then math.rad(self.dragPitch) else 0
+    local yawTotal = math.rad(self.yaw) + self.angle + extraYaw
+    local pLo = math.rad(math.clamp(math.min(self.pitchMin, self.pitchMax), -89, 89))
+    local pHi = math.rad(math.clamp(math.max(self.pitchMin, self.pitchMax), -89, 89))
+    local pitchTotal = math.clamp(math.rad(self.pitch) + extraPitch, pLo, pHi)
+    local v, e1, e2, e3 =
+      Math3D.orbitCamera(cx, cy, cz, yawTotal, pitchTotal, dist)
+    view = v
+    ex, ey, ez = e1, e2, e3
+    -- Store the camera world matrix (inverse view, pre-roll) + fov for ray picking.
+    self.camWorld = Math3D.invert(view)
+    self.fovYRad = fovY
+    if self.roll ~= 0 then
+      view = Math3D.multiply(Math3D.fromRotationZ(math.rad(self.roll)), view)
+    end
+    -- Keep a sane far/near ratio to preserve depth precision (avoid z-fighting
+    -- flicker). Floor the near plane relative to the model size rather than at a
+    -- tiny fixed 0.01, which would blow up the ratio when the camera is close.
+    far = dist + self.focusR * 2
+    local near = math.max(self.focusR * 0.02, dist - self.focusR * 2)
+    if near < far * 0.0005 then
+      near = far * 0.0005
+    end
+    proj = Math3D.perspectiveReverseZ(fovY, aspect, near, far)
   end
-  -- Keep a sane far/near ratio to preserve depth precision (avoid z-fighting
-  -- flicker). Floor the near plane relative to the model size rather than at a
-  -- tiny fixed 0.01, which would blow up the ratio when the camera is close.
-  local far = dist + self.radius * 2
-  local near = math.max(self.radius * 0.02, dist - self.radius * 2)
-  if near < far * 0.0005 then
-    near = far * 0.0005
-  end
-  local proj = Math3D.perspectiveReverseZ(fovY, aspect, near, far)
+
+  self.viewMat = view
+  self.far = far
+  -- Model-centre view depth as a fraction of far (DOF autofocus; matches the
+  -- linear depth the shader packs into alpha).
+  local vz = view[3] * self.center[1]
+    + view[7] * self.center[2]
+    + view[11] * self.center[3]
+    + view[15]
+  self.dofFocusAuto = math.clamp(-vz / math.max(far, 1e-4), 0, 1)
+
   local b = buffer.create(FRAME_SIZE)
   Math3D.writeToBuffer(b, 0, view)
   Math3D.writeToBuffer(b, 64, proj)
@@ -1100,6 +1788,51 @@ local function updateCamera(self: Model)
     Color.blue(self.highlightColor) / 255,
     math.clamp(self.highlightStrength, 0, 1)
   )
+  -- env0 @352: (envIntensity, envMaxLod, envYaw rad, envMode 0 gradient/1 equirect)
+  writeVec4(
+    b,
+    352,
+    math.max(self.envIntensity, 0) * 0.01,
+    self.envMaxLod,
+    math.rad(self.envYaw),
+    self.envMode
+  )
+  -- gradient sky @368 / horizon @384 / ground @400
+  local function writeColor3(off: number, c: Color)
+    writeVec4(b, off, Color.red(c) / 255, Color.green(c) / 255, Color.blue(c) / 255, 0)
+  end
+  writeColor3(368, self.skyColor)
+  writeColor3(384, self.horizonColor)
+  writeColor3(400, self.groundColor)
+  -- shadow0 @416: (strength, bias, map size, pcf radius)
+  local shadowOn = self.shadowPipeline ~= nil and self.shadowStrength > 0
+  writeVec4(
+    b,
+    416,
+    if shadowOn then math.clamp(self.shadowStrength * 0.01, 0, 1) else 0,
+    self.shadowBias,
+    self.shadowMapSize,
+    math.max(self.shadowSoftness, 0)
+  )
+  -- lightVP @432 (also read by the shadow pass itself)
+  Math3D.writeToBuffer(
+    b,
+    432,
+    if shadowOn then lightViewProj(self) else Math3D.identity()
+  )
+  -- mode0 @496: (shadingMode, toonSteps, wireWidth, dofDepth = 1/far or 0)
+  local dofScale = 0
+  if self.postActive and self.dofEnabled and not self.alphaBlend then
+    dofScale = 1 / math.max(far, 1e-4)
+  end
+  writeVec4(
+    b,
+    496,
+    math.clamp(math.floor(self.shadingMode), 0, 3),
+    math.max(2, math.floor(self.toonSteps)),
+    math.max(0.2, self.wireWidth),
+    dofScale
+  )
   frameBuf:write(b, 0)
 end
 
@@ -1135,9 +1868,76 @@ local function refreshHighlight(self: Model)
   end
 end
 
+-- Build (or reuse) the triangle-accurate pick mesh for the current pose.
+-- Lazy: rebuilt only when a pick happens after the pose changed. Skinned and
+-- morphed draws contribute their CPU-deformed positions, so picking follows
+-- the animation (per-node overrides need a single primitive on the node;
+-- multi-primitive deformed nodes fall back to their rest-pose triangles).
+local function currentPickMesh(self: Model): SceneGraph.PickMesh?
+  local glb = self.glb
+  if not glb then
+    return nil
+  end
+  local key = tostring(math.floor(self.animationIndex))
+    .. ':'
+    .. tostring(self.animTime)
+  if self.pickMesh ~= nil and self.pickMeshKey == key then
+    return self.pickMesh
+  end
+  local cached = self.lastWorld
+  local world: { [number]: { number } } = if cached ~= nil
+    then cached
+    else SceneGraph.computeWorldMatrices(glb)
+  self.lastWorld = world
+  local primCount: { [number]: number } = {}
+  for _, d in ipairs(self.draws) do
+    primCount[d.nodeIndex] = (primCount[d.nodeIndex] or 0) + 1
+  end
+  local overrides: { [number]: { number } } = {}
+  local hasOverride = false
+  for _, d in ipairs(self.draws) do
+    if primCount[d.nodeIndex] == 1 then
+      local sp = d.skinnedPos
+      if d.skin and sp then
+        overrides[d.nodeIndex] = sp
+        hasOverride = true
+      elseif d.prim and d.morphBuf and d.lastWeightsKey ~= '' then
+        -- morphed local positions live in the rewritten interleaved buffer;
+        -- transform them to world space for the pick mesh
+        local w = world[d.nodeIndex]
+        if w then
+          local buf = d.morphBuf :: buffer
+          local stride = GLTFMesh.STRIDE
+          local vcount = math.floor(buffer.len(buf) / stride)
+          local flat: { number } = table.create(vcount * 3, 0)
+          for v = 0, vcount - 1 do
+            local px = buffer.readf32(buf, v * stride)
+            local py = buffer.readf32(buf, v * stride + 4)
+            local pz = buffer.readf32(buf, v * stride + 8)
+            local wx, wy, wz = Math3D.transformPoint(w, px, py, pz)
+            flat[v * 3 + 1] = wx
+            flat[v * 3 + 2] = wy
+            flat[v * 3 + 3] = wz
+          end
+          overrides[d.nodeIndex] = flat
+          hasOverride = true
+        end
+      end
+    end
+  end
+  self.pickMesh = SceneGraph.buildPickMesh(
+    glb,
+    world,
+    if hasOverride then overrides else nil
+  )
+  self.pickMeshKey = key
+  return self.pickMesh
+end
+
 -- Ray-pick the closest part under a pointer position (in canvas pixels).
--- Returns the 1-based part index, or 0 if nothing was hit. Uses the per-part
--- world-space AABBs and the stored camera matrix.
+-- Returns the 1-based part index, or 0 if nothing was hit. Triangle-accurate
+-- on the current pose by default (pickPrecise); the per-part AABB test is the
+-- fast path / fallback.
 local function pickPart(self: Model, px: number, py: number): number
   local gpu = self.gpu
   local camWorld = self.camWorld
@@ -1150,6 +1950,16 @@ local function pickPart(self: Model, px: number, py: number): number
   local aspect = gpu.width / gpu.height
   local ox, oy, oz, dx, dy, dz =
     Math3D.screenRay(camWorld, self.fovYRad, aspect, ndcX, ndcY)
+  if self.pickPrecise then
+    local mesh = currentPickMesh(self)
+    if mesh then
+      local t, nodeIdx = SceneGraph.rayPickMesh(mesh, ox, oy, oz, dx, dy, dz)
+      if t ~= nil then
+        return self.nodeToPartIdx[nodeIdx] or 0
+      end
+      return 0
+    end
+  end
   local best = 0
   local bestT = math.huge
   for i, box in ipairs(self.partAABBs) do
@@ -1181,6 +1991,66 @@ local function reportPick(self: Model)
   if self.pickNodeProp ~= nil then
     self.pickNodeProp.value = if part then part.nodeIndex else -1
   end
+end
+
+-- glTF node index of the current selection (-1 = none).
+local function selectionNode(self: Model): number
+  return if self.selectedPart > 0
+    then self.parts[self.selectedPart].nodeIndex
+    else -1
+end
+
+-- Fire a ViewModel Trigger by name. Runtimes/VMs without trigger support fall
+-- back to bumping a Number property of the same name (listen to its changes).
+local function fireTrigger(self: Model, name: string)
+  if name == '' or self.context == nil then
+    return
+  end
+  local vm = (self.context :: Context):viewModel()
+  if not vm then
+    return
+  end
+  local fired = false
+  pcall(function()
+    local t = (vm :: any):getTrigger(name)
+    if t ~= nil then
+      t:fire()
+      fired = true
+    end
+  end)
+  if not fired then
+    pcall(function()
+      local p = vm:getNumber(name)
+      if p then
+        p.value = (tonumber(p.value) or 0) + 1
+      end
+    end)
+  end
+end
+
+-- Inbound selection: the Number property named by selectPropName carries a
+-- glTF node index; writing one (from data binding or another script) selects
+-- that part as if it had been clicked. -1 clears the selection. Echoes of our
+-- own reportPick writes are ignored (same node = no-op).
+local function applyInboundSelection(self: Model)
+  local sp = self.selectProp
+  if sp == nil then
+    return
+  end
+  local want = math.floor(tonumber(sp.value) or -1)
+  if want == selectionNode(self) then
+    return
+  end
+  local target = 0
+  if want >= 0 then
+    target = self.nodeToPartIdx[want] or 0
+    if target == 0 then
+      return -- not a drawable node: ignore
+    end
+  end
+  self.selectedPart = target
+  refreshHighlight(self)
+  reportPick(self)
 end
 
 local function byte01(v: number): number
@@ -1246,6 +2116,7 @@ local function exposeStats(
   setNum('animationCount', animCount)
   setNum('animationDuration', animDur)
   setNum('partCount', #parts)
+  setNum('cameraCount', if glb.cameras then #glb.cameras else 0)
   for i = 1, 3 do
     local m = glb.materials[i]
     if m then
@@ -1334,6 +2205,16 @@ local function imageToView(self: Model, img: any): GPUTextureView?
   return nil
 end
 
+-- The component slot currently bound to a material (nil when none).
+local function compSlotForMat(self: Model, matIndex: number): CompSlot?
+  for _, slot in ipairs(self.compSlots) do
+    if slot.matBound == matIndex then
+      return slot
+    end
+  end
+  return nil
+end
+
 -- Apply the currently databound Image to the material selected by materialIndex.
 -- Stores the resulting view in overrideBasePerMat[matIndex] (or clears it when
 -- the image is nil) and rebuilds the binds so the change is visible immediately.
@@ -1343,7 +2224,7 @@ local function applyMaterialImage(self: Model)
     return
   end
   local matIndex = math.floor(self.materialIndex)
-  if matIndex == self.compMatBound then
+  if compSlotForMat(self, matIndex) ~= nil then
     print(
       '[GLBModel.tex] material '
         .. matIndex
@@ -1400,108 +2281,154 @@ end
 -- COMPONENT-AS-TEXTURE
 -- ===========================================================================
 
--- Set up the component-as-texture pipeline: instantiate the artboard, create
--- the offscreen canvas + GPU texture, install the texture view as the
--- material's base-colour override and build the ray-casting mesh.
-local function initComponentTexture(self: Model, context: Context)
-  self.compMatBound = -1
-  self.compPointerInside = false
+-- Set up the component-as-texture slots (A/B/C): instantiate each assigned
+-- artboard, create its offscreen canvas + GPU texture, install the texture
+-- view as the material's base-colour override and build the ray-casting mesh.
+local function initComponentTextures(self: Model, context: Context)
+  self.compSlots = {}
   local glb = self.glb
   if not glb then
     return
   end
-  local ab: any = (self :: any).componentArtboard
-  if ab == nil then
-    return -- no component assigned in the editor
-  end
-  local matIndex = math.floor(self.componentMatIndex)
-  if matIndex < 0 or matIndex >= #glb.materials then
+  local artboards: { any } = {
+    (self :: any).componentArtboard,
+    (self :: any).componentArtboardB,
+    (self :: any).componentArtboardC,
+  }
+  local matIndices: { number } = {
+    math.floor(self.componentMatIndex),
+    math.floor(self.componentMatIndexB),
+    math.floor(self.componentMatIndexC),
+  }
+  local size = math.max(8, math.floor(self.componentSize))
+  for slotIdx = 1, 3 do
+    local ab = artboards[slotIdx]
+    local matIndex = matIndices[slotIdx]
+    local label = string.sub('ABC', slotIdx, slotIdx)
+    if ab == nil then
+      continue -- slot unassigned in the editor
+    end
+    if matIndex < 0 or matIndex >= #glb.materials then
+      print(
+        string.format(
+          '[GLBModel.comp] slot %s: componentMatIndex %d out of range (0..%d) -- disabled',
+          label,
+          matIndex,
+          math.max(0, #glb.materials - 1)
+        )
+      )
+      continue
+    end
+    if compSlotForMat(self, matIndex) ~= nil then
+      print(
+        '[GLBModel.comp] slot '
+          .. label
+          .. ': material '
+          .. matIndex
+          .. ' is already driven by another slot -- disabled'
+      )
+      continue
+    end
+    local okInst, inst = pcall(function(): any
+      return ab:instance()
+    end)
+    if not okInst or inst == nil then
+      print(
+        '[GLBModel.comp] slot '
+          .. label
+          .. ': could not instantiate the component artboard: '
+          .. tostring(inst)
+      )
+      continue
+    end
+    local okCanvas, canvas = pcall(function(): any
+      return (context :: any):canvas({
+        width = size,
+        height = size,
+        clearColor = Color.rgba(0, 0, 0, 0),
+      })
+    end)
+    if not okCanvas or canvas == nil then
+      print(
+        '[GLBModel.comp] context:canvas unavailable in this runtime: '
+          .. tostring(canvas)
+      )
+      continue
+    end
+    local tex =
+      GPUTexture.new({ width = size, height = size, format = 'rgba8unorm' })
+    local slot: CompSlot = {
+      instance = inst,
+      canvas = canvas,
+      texture = tex,
+      matBound = matIndex,
+      mesh = SceneGraph.buildMaterialTriMesh(glb, matIndex),
+      bounds = { 0, 0, 1, 1 },
+      pointerInside = false,
+      slot = slotIdx,
+    }
+    table.insert(self.compSlots, slot)
+    self.overrideBasePerMat[matIndex] = tex:view()
+    if not slot.mesh then
+      print(
+        '[GLBModel.comp] slot '
+          .. label
+          .. ': no UV-mapped triangles use material '
+          .. matIndex
+          .. '; pointer forwarding disabled'
+      )
+    end
     print(
       string.format(
-        '[GLBModel.comp] componentMatIndex %d out of range (0..%d) -- component texture disabled',
+        '[GLBModel.comp] slot %s active on material %d (%dx%d offscreen)',
+        label,
         matIndex,
-        math.max(0, #glb.materials - 1)
+        size,
+        size
       )
     )
-    return
-  end
-  local okInst, inst = pcall(function(): any
-    return ab:instance()
-  end)
-  if not okInst or inst == nil then
-    print('[GLBModel.comp] could not instantiate the component artboard: ' .. tostring(inst))
-    return
-  end
-  local size = math.max(8, math.floor(self.componentSize))
-  local okCanvas, canvas = pcall(function(): any
-    return (context :: any):canvas({
-      width = size,
-      height = size,
-      clearColor = Color.rgba(0, 0, 0, 0),
-    })
-  end)
-  if not okCanvas or canvas == nil then
-    print('[GLBModel.comp] context:canvas unavailable in this runtime: ' .. tostring(canvas))
-    return
-  end
-  local tex = GPUTexture.new({ width = size, height = size, format = 'rgba8unorm' })
-  self.compInstance = inst
-  self.compCanvas = canvas
-  self.compTexture = tex
-  self.compMatBound = matIndex
-  self.compBounds = { 0, 0, 1, 1 }
-  self.overrideBasePerMat[matIndex] = tex:view()
-  self.compMesh = SceneGraph.buildMaterialTriMesh(glb, matIndex)
-  if not self.compMesh then
-    print('[GLBModel.comp] note: no UV-mapped triangles use material ' .. matIndex .. '; pointer forwarding disabled')
-  end
-  print(
-    string.format(
-      '[GLBModel.comp] component texture active on material %d (%dx%d offscreen)',
-      matIndex,
-      size,
-      size
-    )
-  )
-end
-
--- Render the component into the offscreen canvas and refresh the GPU
--- texture. Runs at the start of drawCanvas, before the 3D pass samples it.
-local function renderComponentTexture(self: Model)
-  local inst, canvas, tex = self.compInstance, self.compCanvas, self.compTexture
-  if inst == nil or canvas == nil or tex == nil then
-    return
-  end
-  local ok, err = pcall(function()
-    local bMin, bMax = inst:bounds()
-    local bw = math.max(1e-6, bMax.x - bMin.x)
-    local bh = math.max(1e-6, bMax.y - bMin.y)
-    self.compBounds = { bMin.x, bMin.y, bw, bh }
-    local renderer = canvas:beginFrame()
-    renderer:save()
-    -- map the artboard bounds onto the full canvas (fills the UV square)
-    renderer:transform(Mat2D.withScale(canvas.width / bw, canvas.height / bh))
-    renderer:transform(Mat2D.withTranslation(-bMin.x, -bMin.y))
-    inst:draw(renderer)
-    renderer:restore()
-    canvas:endFrame()
-    tex:upload({ image = canvas.image })
-  end)
-  if not ok then
-    print('[GLBModel.comp] component render failed: ' .. tostring(err))
   end
 end
 
--- Forward a pointer event onto the component through the mesh UVs.
--- Returns true when the ray hits the component-textured surface.
+-- Render every component slot into its offscreen canvas and refresh the GPU
+-- textures. Runs at the start of drawCanvas, before the 3D pass samples them.
+local function renderComponentTextures(self: Model)
+  for _, slot in ipairs(self.compSlots) do
+    local inst, canvas, tex = slot.instance, slot.canvas, slot.texture
+    if inst ~= nil and canvas ~= nil and tex ~= nil then
+      local ok, err = pcall(function()
+        local bMin, bMax = inst:bounds()
+        local bw = math.max(1e-6, bMax.x - bMin.x)
+        local bh = math.max(1e-6, bMax.y - bMin.y)
+        slot.bounds = { bMin.x, bMin.y, bw, bh }
+        local renderer = canvas:beginFrame()
+        renderer:save()
+        -- map the artboard bounds onto the full canvas (fills the UV square)
+        renderer:transform(
+          Mat2D.withScale(canvas.width / bw, canvas.height / bh)
+        )
+        renderer:transform(Mat2D.withTranslation(-bMin.x, -bMin.y))
+        inst:draw(renderer)
+        renderer:restore()
+        canvas:endFrame()
+        tex:upload({ image = canvas.image })
+      end)
+      if not ok then
+        print('[GLBModel.comp] component render failed: ' .. tostring(err))
+      end
+    end
+  end
+end
+
+-- Forward a pointer event onto the component slots through the mesh UVs.
+-- The nearest hit surface receives the event; slots the pointer left get an
+-- exit. Returns true when the ray hit a component-textured surface.
 local function forwardPointerToComponent(
   self: Model,
   event: PointerEvent,
   kind: string
 ): boolean
-  local inst = self.compInstance
-  local mesh = self.compMesh
-  if inst == nil or mesh == nil or not self.componentInteractive then
+  if #self.compSlots == 0 or not self.componentInteractive then
     return false
   end
   local gpu = self.gpu
@@ -1514,38 +2441,291 @@ local function forwardPointerToComponent(
   local aspect = gpu.width / gpu.height
   local ox, oy, oz, dx, dy, dz =
     Math3D.screenRay(camWorld, self.fovYRad, aspect, ndcX, ndcY)
-  local t, u, v = SceneGraph.rayMeshUV(mesh :: SceneGraph.TriMesh, ox, oy, oz, dx, dy, dz)
-  if t == nil then
-    if self.compPointerInside and kind ~= 'up' then
-      self.compPointerInside = false
+  local bestSlot: CompSlot? = nil
+  local bestT = math.huge
+  local bestU, bestV = 0, 0
+  for _, slot in ipairs(self.compSlots) do
+    local mesh = slot.mesh
+    if slot.instance ~= nil and mesh ~= nil then
+      local t, u, v =
+        SceneGraph.rayMeshUV(mesh :: SceneGraph.TriMesh, ox, oy, oz, dx, dy, dz)
+      if t ~= nil and t < bestT then
+        bestT = t
+        bestSlot = slot
+        bestU, bestV = u, v
+      end
+    end
+  end
+  -- exit any slot the pointer is no longer over
+  for _, slot in ipairs(self.compSlots) do
+    if slot ~= bestSlot and slot.pointerInside and kind ~= 'up' then
+      slot.pointerInside = false
       pcall(function()
-        inst:pointerExit(PointerEvent.new(event.id, Vector.xy(0, 0)))
+        slot.instance:pointerExit(PointerEvent.new(event.id, Vector.xy(0, 0)))
       end)
     end
+  end
+  if bestSlot == nil then
     return false
   end
+  local slot = bestSlot :: CompSlot
   -- glTF UVs wrap; mirror the shader's flipV toggle so the touch point lands
   -- on the pixel actually shown.
-  u = u % 1
-  v = v % 1
+  local u = bestU % 1
+  local v = bestV % 1
   if self.flipV then
     v = 1 - v
   end
-  local b = self.compBounds
+  local b = slot.bounds
   local ax = b[1] + u * b[3]
   local ay = b[2] + v * b[4]
   local ev = PointerEvent.new(event.id, Vector.xy(ax, ay))
-  self.compPointerInside = true
+  slot.pointerInside = true
   pcall(function()
     if kind == 'down' then
-      inst:pointerDown(ev)
+      slot.instance:pointerDown(ev)
     elseif kind == 'up' then
-      inst:pointerUp(ev)
+      slot.instance:pointerUp(ev)
     else
-      inst:pointerMove(ev)
+      slot.instance:pointerMove(ev)
     end
   end)
   return true
+end
+
+-- ===========================================================================
+-- POST FX (offscreen scene + fullscreen passes from shaders/post.wgsl)
+-- ===========================================================================
+
+-- Create the post-FX resources: offscreen scene target, half-res bloom chain,
+-- fullscreen pipelines from the 'post' shader asset and their bind groups.
+local function initPostFX(self: Model, gpuContext: any, gpu: GPUCanvas)
+  local ok, err = pcall(function()
+    local postShader = gpuContext:shader(self.postShaderName)
+    if not postShader then
+      postShader = gpuContext:shader(self.postShaderName .. '.wgsl')
+    end
+    if not postShader then
+      error(
+        'post shader asset \'' .. tostring(self.postShaderName) .. '\' not found'
+      )
+    end
+    local W = math.max(2, math.floor(self.canvasW))
+    local H = math.max(2, math.floor(self.canvasH))
+    local hw = math.max(1, math.floor(W / 2))
+    local hh = math.max(1, math.floor(H / 2))
+    local sceneTex = GPUTexture.new({
+      width = W,
+      height = H,
+      format = gpu.format,
+      renderTarget = true,
+    })
+    local brightTex = GPUTexture.new({
+      width = hw,
+      height = hh,
+      format = 'rgba8unorm',
+      renderTarget = true,
+    })
+    local blurA = GPUTexture.new({
+      width = hw,
+      height = hh,
+      format = 'rgba8unorm',
+      renderTarget = true,
+    })
+    local blurB = GPUTexture.new({
+      width = hw,
+      height = hh,
+      format = 'rgba8unorm',
+      renderTarget = true,
+    })
+    local layoutP =
+      GPUBindGroupLayout.new({ shader = postShader, groupIndex = 0 })
+    local function pipe(entry: string, format: string): GPUPipeline
+      return GPUPipeline.new({
+        vertex = { module = postShader, entryPoint = 'vs_fullscreen' },
+        fragment = { module = postShader, entryPoint = entry },
+        vertexLayout = {},
+        colorTargets = { { format = format } :: ColorTarget },
+        cullMode = 'none',
+        topology = 'triangle-list',
+        sampleCount = 1,
+        bindGroupLayouts = { layoutP },
+      })
+    end
+    local pipeBright = pipe('fs_bright', 'rgba8unorm')
+    local pipeBlur = pipe('fs_blur', 'rgba8unorm')
+    local pipeComposite = pipe('fs_composite', gpu.format)
+    local white = self.whiteView :: GPUTextureView
+    local clampS = self.clampSampler
+    local function bufAndBind(
+      srcView: GPUTextureView,
+      auxView: GPUTextureView
+    ): (GPUBuffer, GPUBindGroup)
+      local ub = GPUBuffer.new({ size = POST_SIZE, usage = 'uniform' })
+      local bind = GPUBindGroup.new({
+        layout = layoutP,
+        ubos = {
+          { slot = 0, buffer = ub, offset = 0, size = POST_SIZE } :: UBOEntry,
+        },
+        textures = {
+          { slot = 1, view = srcView } :: TextureEntry,
+          { slot = 3, view = auxView } :: TextureEntry,
+        },
+        samplers = { { slot = 2, sampler = clampS } :: SamplerEntry },
+      })
+      return ub, bind
+    end
+    local sceneView = sceneTex:view()
+    self.postBufBright, self.postBindBright = bufAndBind(sceneView, white)
+    self.postBufBlurH, self.postBindBlurH = bufAndBind(brightTex:view(), white)
+    self.postBufBlurV, self.postBindBlurV = bufAndBind(blurA:view(), white)
+    self.postBufComposite, self.postBindComposite =
+      bufAndBind(sceneView, blurB:view())
+    -- index buffer for the fullscreen triangle (no vertex buffer needed;
+    -- padded to 8 bytes for alignment)
+    local ib = buffer.create(8)
+    buffer.writeu16(ib, 0, 0)
+    buffer.writeu16(ib, 2, 1)
+    buffer.writeu16(ib, 4, 2)
+    self.fsIbo =
+      GPUBuffer.new({ size = 8, usage = 'index', data = ib, immutable = true })
+    self.sceneTex = sceneTex
+    self.brightTex = brightTex
+    self.blurTexA = blurA
+    self.blurTexB = blurB
+    self.postPipeBright = pipeBright
+    self.postPipeBlur = pipeBlur
+    self.postPipeComposite = pipeComposite
+    self.postActive = true
+    print('[GLBModel.post] post FX chain ready (' .. W .. 'x' .. H .. ' offscreen)')
+  end)
+  if not ok then
+    print('[GLBModel.post] post FX disabled: ' .. tostring(err))
+    self.postActive = false
+    self.sceneTex = nil
+  end
+end
+
+-- Write one Post uniform block (texel size + blur dir + live effect params).
+local function writePostBlock(
+  self: Model,
+  buf: GPUBuffer,
+  srcW: number,
+  srcH: number,
+  dirX: number,
+  dirY: number
+)
+  local b = buffer.create(POST_SIZE)
+  writeVec4(b, 0, 1 / srcW, 1 / srcH, dirX, dirY)
+  local thr = math.max(self.bloomThreshold, 0)
+  writeVec4(
+    b,
+    16,
+    thr,
+    math.max(thr * 0.5, 1e-3),
+    math.max(self.bloomIntensity, 0),
+    if self.bloomEnabled then 1 else 0
+  )
+  writeVec4(
+    b,
+    32,
+    math.clamp(self.vignetteAmount, 0, 1),
+    math.clamp(self.vignetteRadius, 0, 1),
+    math.max(self.vignetteSoftness, 1e-3),
+    if self.vignetteAmount > 0 then 1 else 0
+  )
+  writeVec4(
+    b,
+    48,
+    math.max(self.gradeExposure, 0),
+    math.max(self.gradeContrast, 0),
+    math.max(self.gradeSaturation, 0),
+    if self.gradeEnabled then 1 else 0
+  )
+  local focus = if self.dofAutoFocus
+    then self.dofFocusAuto
+    else math.clamp(self.dofFocus, 0, 1)
+  writeVec4(
+    b,
+    64,
+    focus,
+    math.max(self.dofRange, 1e-3),
+    math.max(self.dofRadius, 0),
+    if self.dofEnabled and not self.alphaBlend then 1 else 0
+  )
+  buf:write(b, 0)
+end
+
+-- Fullscreen post chain: bright -> blur H -> blur V -> composite into the
+-- visible canvas. Bloom passes are skipped when bloom is off; the composite
+-- always runs (it applies DOF/grade/vignette and the plain passthrough).
+local function runPostFX(self: Model, gpu: GPUCanvas)
+  local fsIbo = self.fsIbo
+  local pipeBright, pipeBlur, pipeComposite =
+    self.postPipeBright, self.postPipeBlur, self.postPipeComposite
+  if not fsIbo or not pipeBright or not pipeBlur or not pipeComposite then
+    return
+  end
+  local W, H = gpu.width, gpu.height
+  local hw = math.max(1, math.floor(W / 2))
+  local hh = math.max(1, math.floor(H / 2))
+  local function fsPass(
+    pipe: GPUPipeline,
+    bind: GPUBindGroup?,
+    targetView: GPUTextureView?,
+    w: number,
+    h: number
+  )
+    local colorArr: any
+    if targetView ~= nil then
+      colorArr = {
+        {
+          view = targetView,
+          loadOp = 'clear',
+          storeOp = 'store',
+          clearColor = { 0, 0, 0, 0 },
+        },
+      }
+    else
+      colorArr =
+        { { loadOp = 'clear', storeOp = 'store', clearColor = { 0, 0, 0, 0 } } }
+    end
+    local p = gpu:beginRenderPass({ color = colorArr })
+    p:setViewport(0, 0, w, h)
+    p:setPipeline(pipe)
+    p:setBindGroup(0, bind)
+    p:setIndexBuffer(fsIbo, 'uint16')
+    p:drawIndexed(3)
+    p:finish()
+  end
+  if self.bloomEnabled then
+    writePostBlock(self, self.postBufBright :: GPUBuffer, W, H, 0, 0)
+    fsPass(
+      pipeBright,
+      self.postBindBright,
+      (self.brightTex :: GPUTexture):view(),
+      hw,
+      hh
+    )
+    writePostBlock(self, self.postBufBlurH :: GPUBuffer, hw, hh, 1.6, 0)
+    fsPass(
+      pipeBlur,
+      self.postBindBlurH,
+      (self.blurTexA :: GPUTexture):view(),
+      hw,
+      hh
+    )
+    writePostBlock(self, self.postBufBlurV :: GPUBuffer, hw, hh, 0, 1.6)
+    fsPass(
+      pipeBlur,
+      self.postBindBlurV,
+      (self.blurTexB :: GPUTexture):view(),
+      hw,
+      hh
+    )
+  end
+  writePostBlock(self, self.postBufComposite :: GPUBuffer, W, H, 0, 0)
+  fsPass(pipeComposite, self.postBindComposite, nil, W, H)
 end
 
 function init(self: Model, context: Context): boolean
@@ -1610,21 +2790,38 @@ function init(self: Model, context: Context): boolean
   local glb: GLBParser.GLBData = (res :: any).data
   self.glb = glb
 
-  local draws, objBytes, center, radius, aabb, verts, tris, parts, partAABBs =
-    buildDraws(glb)
+  local wireframe = math.floor(self.shadingMode) == 3
+  local draws,
+    objBytes,
+    center,
+    radius,
+    aabb,
+    verts,
+    tris,
+    parts,
+    partAABBs,
+    nodeToPart =
+    buildDraws(glb, wireframe)
   self.draws = draws
   self.objBytes = objBytes
   self.center = center
   self.radius = radius
   self.parts = parts
   self.partAABBs = partAABBs
+  self.nodeToPartIdx = nodeToPart
+  -- camera focus glide starts on the whole model
+  self.focusCx, self.focusCy, self.focusCz = center[1], center[2], center[3]
+  self.focusR = radius
   print(string.format('[GLBModel] parts (pickable nodes)=%d', #parts))
   self.hasAnim = glb.animations ~= nil and #glb.animations > 0
   self.animDuration = if self.hasAnim
     then GLBParser.getAnimationDuration(glb, self.animationIndex + 1)
     else 0
   self.animTime = 0
-  applySkinning(self, SceneGraph.computeWorldMatrices(glb))
+  local restWorld = SceneGraph.computeWorldMatrices(glb)
+  self.lastWorld = restWorld
+  applyMorphTargets(self, nil) -- bake any non-zero default morph weights
+  applySkinning(self, restWorld, nil)
   print(
     string.format(
       '[GLBModel] draws=%d verts=%d tris=%d center=(%.2f,%.2f,%.2f) radius=%.2f format=%s anim=%s',
@@ -1650,13 +2847,56 @@ function init(self: Model, context: Context): boolean
   buffer.writeu8(wb, 3, 255)
   whiteTex:upload({ data = wb })
   local whiteView = whiteTex:view()
-  local gpuSampler = GPUSampler.new({
+  self.whiteView = whiteView
+  -- Material sampler: trilinear over the uploaded mip chains, anisotropic
+  -- when the device supports it. Falls back to plain bilinear on older builds.
+  local gpuSampler: GPUSampler? = nil
+  pcall(function()
+    local desc: any = {
+      min = 'linear',
+      mag = 'linear',
+      mipmap = 'linear',
+      wrapU = 'repeat',
+      wrapV = 'repeat',
+    }
+    pcall(function()
+      local feats = gpuContext:features()
+      if feats and feats.anisotropicFiltering then
+        desc.maxAnisotropy = 8
+      end
+    end)
+    gpuSampler = GPUSampler.new(desc)
+  end)
+  if gpuSampler == nil then
+    gpuSampler = GPUSampler.new({
+      min = 'linear',
+      mag = 'linear',
+      wrapU = 'repeat',
+      wrapV = 'repeat',
+    })
+  end
+  self.gpuSampler = gpuSampler
+  -- clamp sampler: shadow map + post FX reads
+  local clampSampler = GPUSampler.new({
     min = 'linear',
     mag = 'linear',
-    wrapU = 'repeat',
-    wrapV = 'repeat',
+    wrapU = 'clamp',
+    wrapV = 'clamp',
   })
-  self.gpuSampler = gpuSampler
+  self.clampSampler = clampSampler
+  -- environment sampler: wrap around in yaw, clamp at the poles, trilinear
+  -- across the prefiltered mips
+  local envSampler: GPUSampler? = nil
+  pcall(function()
+    envSampler = GPUSampler.new({
+      min = 'linear',
+      mag = 'linear',
+      mipmap = 'linear',
+      wrapU = 'repeat',
+      wrapV = 'clamp',
+    })
+  end)
+  self.envSampler = envSampler or clampSampler
 
   -- Vertex layout matches GLTFMesh's interleaved output (stride 72):
   --   0 pos.xyz | 1 normal.xyz | 2 uv0.xy | 3 tangent.xyzw | 4 uv1.xy | 5 color.rgba
@@ -1671,35 +2911,33 @@ function init(self: Model, context: Context): boolean
   local vlayout: { VertexBufferLayout } = {
     { stride = GLTFMesh.STRIDE, attributes = attrs } :: VertexBufferLayout,
   }
-  -- PREMULTIPLIED alpha blending for transparent models. The shader now outputs
-  -- premultiplied RGB (rgb already scaled by alpha), so the blend is
-  -- srcColor * 1 + dstColor * (1 - srcAlpha); alpha = src + dst*(1-src).
-  local ctargets: { ColorTarget }
-  if self.alphaBlend then
-    ctargets = {
-      {
-        format = gpu.format,
-        blend = {
-          srcColor = 'one',
-          dstColor = 'one-minus-src-alpha',
-          colorOp = 'add',
-          srcAlpha = 'one',
-          dstAlpha = 'one-minus-src-alpha',
-          alphaOp = 'add',
-        },
-      } :: ColorTarget,
-    }
-  else
-    ctargets = {
-      { format = gpu.format } :: ColorTarget,
-    }
-  end
+  -- Two pipelines over the same layouts: opaque (depth write on, no blend)
+  -- and BLEND (premultiplied srcOver, depth test on / write off; those draws
+  -- are sorted back-to-front in drawCanvas). The global alphaBlend input
+  -- forces every draw through the blend pipeline.
+  local opaqueTargets: { ColorTarget } = {
+    { format = gpu.format } :: ColorTarget,
+  }
+  local blendTargets: { ColorTarget } = {
+    {
+      format = gpu.format,
+      blend = {
+        srcColor = 'one',
+        dstColor = 'one-minus-src-alpha',
+        colorOp = 'add',
+        srcAlpha = 'one',
+        dstAlpha = 'one-minus-src-alpha',
+        alphaOp = 'add',
+      },
+    } :: ColorTarget,
+  }
   local layout0 = GPUBindGroupLayout.new({ shader = shader, groupIndex = 0 })
   local layout1 = GPUBindGroupLayout.new({
     shader = shader,
     groupIndex = 1,
     dynamicUBOs = { 0 },
   })
+  self.layout0 = layout0
   self.layout1 = layout1
   local bgls: { GPUBindGroupLayout } = { layout0, layout1 }
   local cullStr = if self.cullMode == 1
@@ -1710,7 +2948,7 @@ function init(self: Model, context: Context): boolean
     vertex = { module = shader, entryPoint = 'vs_main' },
     fragment = { module = shader, entryPoint = 'fs_main' },
     vertexLayout = vlayout,
-    colorTargets = ctargets,
+    colorTargets = opaqueTargets,
     depthStencil = {
       format = 'depth24plus-stencil8',
       -- Reverse-Z: near maps to 1, far to 0, so closer fragments have a LARGER
@@ -1723,6 +2961,71 @@ function init(self: Model, context: Context): boolean
     sampleCount = samples,
     bindGroupLayouts = bgls,
   })
+  self.pipelineBlend = nil
+  pcall(function()
+    self.pipelineBlend = GPUPipeline.new({
+      vertex = { module = shader, entryPoint = 'vs_main' },
+      fragment = { module = shader, entryPoint = 'fs_main' },
+      vertexLayout = vlayout,
+      colorTargets = blendTargets,
+      depthStencil = {
+        format = 'depth24plus-stencil8',
+        compare = 'greater',
+        write = false, -- sorted back-to-front instead
+      },
+      cullMode = cullStr,
+      topology = 'triangle-list',
+      sampleCount = samples,
+      bindGroupLayouts = bgls,
+    })
+  end)
+
+  -- Shadow pass resources (only when enabled at init). Uses its own depth
+  -- convention: standard z, clear 1, compare 'less' -- matching the packed
+  -- depth comparison in the shader.
+  self.shadowMapSize = 1024
+  if self.shadowEnabled then
+    local okShadow, errShadow = pcall(function()
+      local ss = math.clamp(math.floor(self.shadowSize), 256, 4096)
+      local st = GPUTexture.new({
+        width = ss,
+        height = ss,
+        format = 'rgba8unorm',
+        renderTarget = true,
+      })
+      local sd = GPUTexture.new({
+        width = ss,
+        height = ss,
+        format = 'depth24plus-stencil8',
+        renderTarget = true,
+      })
+      local sp = GPUPipeline.new({
+        vertex = { module = shader, entryPoint = 'vs_shadow' },
+        fragment = { module = shader, entryPoint = 'fs_shadow' },
+        vertexLayout = vlayout,
+        colorTargets = { { format = 'rgba8unorm' } :: ColorTarget },
+        depthStencil = {
+          format = 'depth24plus-stencil8',
+          compare = 'less',
+          write = true,
+        },
+        cullMode = 'none',
+        topology = 'triangle-list',
+        sampleCount = 1,
+        bindGroupLayouts = bgls,
+      })
+      self.shadowTex = st
+      self.shadowDepthTex = sd
+      self.shadowPipeline = sp
+      self.shadowMapSize = ss
+    end)
+    if not okShadow then
+      print(
+        '[GLBModel.shadow] shadow pass unavailable (old shader asset?): '
+          .. tostring(errShadow)
+      )
+    end
+  end
 
   local frameBuf = GPUBuffer.new({ size = FRAME_SIZE, usage = 'uniform' })
   self.frameBuf = frameBuf
@@ -1733,10 +3036,14 @@ function init(self: Model, context: Context): boolean
   })
   self.objBuf = objBuf
 
-  local frameUbos: { UBOEntry } = {
-    { slot = 0, buffer = frameBuf, offset = 0, size = FRAME_SIZE } :: UBOEntry,
-  }
-  self.frameBind = GPUBindGroup.new({ layout = layout0, ubos = frameUbos })
+  -- Group-0 bind groups (frame UBO + shadow + environment, with fallback).
+  rebuildFrameBinds(self)
+
+  -- Post FX chain (offscreen scene + fullscreen passes).
+  self.postActive = false
+  if self.postEnabled then
+    initPostFX(self, gpuContext, gpu)
+  end
 
   -- Texture system: textures come from the GLB itself (embedded PNG/JPEG, decoded
   -- per material slot -- base / metallic-roughness / emissive). Works for ANY
@@ -1789,16 +3096,33 @@ function init(self: Model, context: Context): boolean
   if vm and self.pickNodePropName ~= '' then
     self.pickNodeProp = vm:getNumber(self.pickNodePropName)
   end
+  -- Inbound selection: listen to a Number property carrying a node index.
+  if vm and self.selectPropName ~= '' then
+    local sprop = vm:getNumber(self.selectPropName)
+    if sprop then
+      self.selectProp = sprop
+      sprop:addListener(sprop, function()
+        applyInboundSelection(self)
+      end)
+    else
+      print(
+        '[GLBModel.pick] ViewModel has no Number property named \''
+          .. tostring(self.selectPropName)
+          .. '\' (inbound selection disabled)'
+      )
+    end
+  end
 
-  -- Component-as-texture: instantiate + install the live texture override
-  -- BEFORE the first bind build so the material samples it from frame one.
-  initComponentTexture(self, context)
+  -- Component-as-texture: instantiate + install the live texture overrides
+  -- BEFORE the first bind build so the materials sample them from frame one.
+  initComponentTextures(self, context)
 
   -- Bind immediately (overrides + white fallback), then decode embedded GLB
   -- textures in the background and rebind as they finish.
   rebuildMatBinds(self)
   applyMaterialImage(self) -- apply any already-bound databound image
   loadEmbeddedTextures(self, context)
+  loadEnvironment(self, context)
 
   print(
     string.format(
@@ -1831,18 +3155,35 @@ function update(self: Model)
   if math.floor(self.materialIndex) ~= self.lastBoundMatIndex then
     applyMaterialImage(self)
   end
-  -- If componentMatIndex changed, move the live component texture to the new
+  -- If a slot's componentMatIndex changed, move its live texture to the new
   -- material (and rebuild the ray-casting mesh to match).
   do
     local glb = self.glb
-    local tex = self.compTexture
-    if glb and tex and self.compMatBound >= 0 then
-      local want = math.floor(self.componentMatIndex)
-      if want ~= self.compMatBound and want >= 0 and want < #glb.materials then
-        self.overrideBasePerMat[self.compMatBound] = nil
-        self.compMatBound = want
-        self.overrideBasePerMat[want] = (tex :: GPUTexture):view()
-        self.compMesh = SceneGraph.buildMaterialTriMesh(glb, want)
+    if glb and #self.compSlots > 0 then
+      local wants: { number } = {
+        math.floor(self.componentMatIndex),
+        math.floor(self.componentMatIndexB),
+        math.floor(self.componentMatIndexC),
+      }
+      local changed = false
+      for _, slot in ipairs(self.compSlots) do
+        local want = wants[slot.slot]
+        local tex = slot.texture
+        if
+          tex ~= nil
+          and want ~= slot.matBound
+          and want >= 0
+          and want < #glb.materials
+          and compSlotForMat(self, want) == nil
+        then
+          self.overrideBasePerMat[slot.matBound] = nil
+          slot.matBound = want
+          self.overrideBasePerMat[want] = (tex :: GPUTexture):view()
+          slot.mesh = SceneGraph.buildMaterialTriMesh(glb, want)
+          changed = true
+        end
+      end
+      if changed then
         rebuildMatBinds(self)
       end
     end
@@ -1852,11 +3193,77 @@ end
 
 function advance(self: Model, seconds: number): boolean
   self.angle += math.rad(self.autoSpin) * seconds
-  if self.compInstance ~= nil then
-    pcall(function()
-      self.compInstance:advance(seconds)
-    end)
+  for _, slot in ipairs(self.compSlots) do
+    if slot.instance ~= nil then
+      pcall(function()
+        slot.instance:advance(seconds)
+      end)
+    end
   end
+
+  -- Orbit inertia: while dragging, estimate the flick velocity from the
+  -- pixels accumulated since the last advance; after release, glide it out.
+  if self.interactive then
+    if self.dragging then
+      if seconds > 1e-4 then
+        local iv = 1 / seconds
+        self.velYaw = self.flickDX * self.dragSpeed * iv * 0.5
+          + self.velYaw * 0.5
+        self.velPitch = self.flickDY * self.dragSpeed * iv * 0.5
+          + self.velPitch * 0.5
+      end
+      self.flickDX, self.flickDY = 0, 0
+    elseif
+      self.inertia > 0
+      and (math.abs(self.velYaw) > 0.05 or math.abs(self.velPitch) > 0.05)
+    then
+      self.dragYaw += self.velYaw * seconds
+      self.dragPitch += self.velPitch * seconds
+      local damp = math.exp(
+        -seconds * (10 * (1 - math.clamp(self.inertia, 0, 1)) + 1.2)
+      )
+      self.velYaw *= damp
+      self.velPitch *= damp
+      if self.context then
+        self.context:markNeedsUpdate()
+      end
+    end
+  end
+
+  -- Focus glide (zoom-to-part): ease the camera target onto the selected
+  -- part's bounds, or back onto the whole model.
+  do
+    local tx, ty, tz, tr =
+      self.center[1], self.center[2], self.center[3], self.radius
+    if self.focusOnSelect and self.selectedPart > 0 then
+      local box = self.partAABBs[self.selectedPart]
+      if box then
+        tx = (box.min[1] + box.max[1]) * 0.5
+        ty = (box.min[2] + box.max[2]) * 0.5
+        tz = (box.min[3] + box.max[3]) * 0.5
+        local bx = box.max[1] - box.min[1]
+        local by = box.max[2] - box.min[2]
+        local bz = box.max[3] - box.min[3]
+        tr = math.max(
+          0.5 * math.sqrt(bx * bx + by * by + bz * bz),
+          self.radius * 0.05
+        )
+      end
+    end
+    local k = 1 - math.exp(-5 * seconds)
+    self.focusCx += (tx - self.focusCx) * k
+    self.focusCy += (ty - self.focusCy) * k
+    self.focusCz += (tz - self.focusCz) * k
+    self.focusR += (tr - self.focusR) * k
+    local resid = math.abs(tx - self.focusCx)
+      + math.abs(ty - self.focusCy)
+      + math.abs(tz - self.focusCz)
+      + math.abs(tr - self.focusR)
+    if resid > self.radius * 1e-4 and self.context then
+      self.context:markNeedsUpdate()
+    end
+  end
+
   local glb, objBuf, objBytes = self.glb, self.objBuf, self.objBytes
   if self.hasAnim and self.animDuration > 0 and glb and objBuf and objBytes then
     if self.playAnimation then
@@ -1865,9 +3272,10 @@ function advance(self: Model, seconds: number): boolean
     else
       self.animTime = self.animationTime % self.animDuration -- scrub / keyframe
     end
-    local overrides =
+    local overrides, animWeights =
       SceneGraph.sampleClip(glb, self.animationIndex + 1, self.animTime)
     local world = SceneGraph.computeWorldMatrices(glb, overrides)
+    self.lastWorld = world -- GLB cameras + accurate picking follow the pose
     for _, d in ipairs(self.draws) do
       if not d.skin then
         local w = world[d.nodeIndex]
@@ -1879,15 +3287,16 @@ function advance(self: Model, seconds: number): boolean
       end
     end
     objBuf:write(objBytes, 0)
-    applySkinning(self, world)
+    applyMorphTargets(self, animWeights)
+    applySkinning(self, world, animWeights)
   end
   updateCamera(self)
   return true
 end
 
 function drawCanvas(self: Model)
-  -- refresh the component texture before the 3D pass samples it
-  renderComponentTexture(self)
+  -- refresh the component textures before the 3D pass samples them
+  renderComponentTextures(self)
   local gpu, pipeline, depth, frameBind =
     self.gpu, self.pipeline, self.depth, self.frameBind
   if not gpu or not pipeline or not depth or not frameBind then
@@ -1896,9 +3305,66 @@ function drawCanvas(self: Model)
   if gpu.width <= 0 or gpu.height <= 0 or #self.draws == 0 then
     return
   end
+
+  -- ---- shadow pass: depth from light 1, packed into rgba8 ----
+  local shadowTex, shadowDepth, shadowPipe, shadowBind =
+    self.shadowTex, self.shadowDepthTex, self.shadowPipeline, self.frameBindShadow
+  if
+    shadowTex ~= nil
+    and shadowDepth ~= nil
+    and shadowPipe ~= nil
+    and shadowBind ~= nil
+    and self.shadowStrength > 0
+  then
+    local okShadow = pcall(function()
+      local sp = gpu:beginRenderPass({
+        color = {
+          {
+            view = (shadowTex :: GPUTexture):view(),
+            loadOp = 'clear',
+            storeOp = 'store',
+            clearColor = { 1, 1, 1, 1 }, -- packDepth(1) = nothing in shadow
+          },
+        },
+        depthStencil = {
+          view = (shadowDepth :: GPUTexture):view(),
+          depthLoadOp = 'clear',
+          depthStoreOp = 'store',
+          depthClearValue = 1.0, -- standard z here: near 0, far 1
+          stencilLoadOp = 'clear',
+          stencilStoreOp = 'store',
+          stencilClearValue = 0,
+        },
+      })
+      sp:setViewport(0, 0, self.shadowMapSize, self.shadowMapSize)
+      sp:setPipeline(shadowPipe)
+      sp:setBindGroup(0, shadowBind)
+      for _, d in ipairs(self.draws) do
+        if not d.blended then -- transparent surfaces don't cast
+          local bg = if d.materialIndex ~= nil
+            then self.matBinds[d.materialIndex + 1]
+            else self.fallbackBind
+          if bg then
+            sp:setVertexBuffer(0, d.vbo)
+            sp:setIndexBuffer(d.ibo, d.indexFormat :: 'uint16' | 'uint32')
+            sp:setBindGroup(1, bg, { d.recordIndex * STRIDE })
+            sp:drawIndexed(d.indexCount)
+          end
+        end
+      end
+      sp:finish()
+    end)
+    if not okShadow then
+      self.shadowPipeline = nil -- disable rather than failing every frame
+      print('[GLBModel.shadow] shadow pass failed; disabled')
+    end
+  end
+
+  -- ---- main pass (into the canvas, or offscreen when post FX is on) ----
   local msaaC = self.msaaColor
+  local postOn = self.postActive and self.sceneTex ~= nil
   -- Premultiplied clear color: the canvas is composited with 'srcOver' (which
-  -- expects premultiplied alpha) and the shader now outputs premultiplied RGB,
+  -- expects premultiplied alpha) and the shader outputs premultiplied RGB,
   -- so the background must match -- multiply RGB by bgAlpha. With bgAlpha = 0
   -- this yields (0,0,0,0): a truly transparent background.
   local ba = math.clamp(self.bgAlpha, 0, 1)
@@ -1913,9 +3379,20 @@ function drawCanvas(self: Model)
     colorArr = {
       {
         view = msaaC:view(),
-        resolveTarget = gpu:colorView(),
+        resolveTarget = if postOn
+          then (self.sceneTex :: GPUTexture):view()
+          else gpu:colorView(),
         loadOp = 'clear',
         storeOp = 'discard',
+        clearColor = clearCol,
+      },
+    }
+  elseif postOn then
+    colorArr = {
+      {
+        view = (self.sceneTex :: GPUTexture):view(),
+        loadOp = 'clear',
+        storeOp = 'store',
         clearColor = clearCol,
       },
     }
@@ -1942,18 +3419,66 @@ function drawCanvas(self: Model)
   pass:setViewport(0, 0, gpu.width, gpu.height)
   pass:setPipeline(pipeline)
   pass:setBindGroup(0, frameBind)
+  -- Opaque (and MASK) draws first with depth writes; BLEND draws are
+  -- collected, sorted back-to-front and drawn without depth writes.
+  local blendList: { DrawGPU } = {}
+  local forceBlend = self.alphaBlend
   for _, d in ipairs(self.draws) do
-    local bg = if d.materialIndex ~= nil
-      then self.matBinds[d.materialIndex + 1]
-      else self.fallbackBind
-    if bg then
-      pass:setVertexBuffer(0, d.vbo)
-      pass:setIndexBuffer(d.ibo, d.indexFormat :: 'uint16' | 'uint32')
-      pass:setBindGroup(1, bg, { d.recordIndex * STRIDE })
-      pass:drawIndexed(d.indexCount)
+    if (d.blended or forceBlend) and self.pipelineBlend ~= nil then
+      table.insert(blendList, d)
+    else
+      local bg = if d.materialIndex ~= nil
+        then self.matBinds[d.materialIndex + 1]
+        else self.fallbackBind
+      if bg then
+        pass:setVertexBuffer(0, d.vbo)
+        pass:setIndexBuffer(d.ibo, d.indexFormat :: 'uint16' | 'uint32')
+        pass:setBindGroup(1, bg, { d.recordIndex * STRIDE })
+        pass:drawIndexed(d.indexCount)
+      end
+    end
+  end
+  if #blendList > 0 then
+    -- back-to-front by the view-space depth of each record's translation
+    local view = self.viewMat
+    local objBytes = self.objBytes
+    if view and objBytes then
+      for _, d in ipairs(blendList) do
+        local off = d.recordIndex * STRIDE
+        local x = buffer.readf32(objBytes, off + 48)
+        local y = buffer.readf32(objBytes, off + 52)
+        local z = buffer.readf32(objBytes, off + 56)
+        d.viewDepth = view[3] * x + view[7] * y + view[11] * z + view[15]
+      end
+      table.sort(blendList, function(a: DrawGPU, b: DrawGPU)
+        return a.viewDepth < b.viewDepth
+      end)
+    end
+    pass:setPipeline(self.pipelineBlend)
+    for _, d in ipairs(blendList) do
+      local bg = if d.materialIndex ~= nil
+        then self.matBinds[d.materialIndex + 1]
+        else self.fallbackBind
+      if bg then
+        pass:setVertexBuffer(0, d.vbo)
+        pass:setIndexBuffer(d.ibo, d.indexFormat :: 'uint16' | 'uint32')
+        pass:setBindGroup(1, bg, { d.recordIndex * STRIDE })
+        pass:drawIndexed(d.indexCount)
+      end
     end
   end
   pass:finish()
+
+  -- ---- post passes: bloom / vignette / grade / DOF, then composite ----
+  if postOn then
+    local okPost = pcall(function()
+      runPostFX(self, gpu)
+    end)
+    if not okPost then
+      self.postActive = false -- disable rather than failing every frame
+      print('[GLBModel.post] post pass failed; disabled')
+    end
+  end
 end
 
 function draw(self: Model, renderer: Renderer)
@@ -1973,7 +3498,43 @@ local function eventToCanvas(self: Model, event: PointerEvent): (number, number)
   return event.position.x, event.position.y
 end
 
+-- Sorted ids of the currently tracked pointers.
+local function pointerIds(self: Model): { number }
+  local ids: { number } = {}
+  for id in pairs(self.activePointers) do
+    table.insert(ids, id)
+  end
+  table.sort(ids)
+  return ids
+end
+
+-- Enter pinch mode from the two oldest tracked pointers.
+local function startPinch(self: Model)
+  local ids = pointerIds(self)
+  if #ids < 2 then
+    return
+  end
+  local a = self.activePointers[ids[1]]
+  local b = self.activePointers[ids[2]]
+  local dx, dy = b[1] - a[1], b[2] - a[2]
+  self.pinching = true
+  self.dragging = false
+  self.velYaw, self.velPitch = 0, 0
+  self.flickDX, self.flickDY = 0, 0
+  self.pinchBaseDist = math.max(20, math.sqrt(dx * dx + dy * dy))
+  self.pinchBaseZoom = self.zoom
+  self.pinchLastCX = (a[1] + b[1]) * 0.5
+  self.pinchLastCY = (a[2] + b[2]) * 0.5
+end
+
 function pointerDown(self: Model, event: PointerEvent)
+  self.activePointers[event.id] = { event.position.x, event.position.y }
+  -- A second finger turns the gesture into pinch zoom + two-finger pan.
+  if self.interactive and #pointerIds(self) >= 2 then
+    startPinch(self)
+    event:hit()
+    return
+  end
   local handled = false
   -- The interactive component texture gets first dibs: when the press lands
   -- on the component-textured surface, forward it instead of starting an
@@ -1990,15 +3551,21 @@ function pointerDown(self: Model, event: PointerEvent)
     self.dragging = true
     self.lastPointerX = event.position.x
     self.lastPointerY = event.position.y
+    self.velYaw, self.velPitch = 0, 0 -- a new touch stops any glide
+    self.flickDX, self.flickDY = 0, 0
     handled = true
   end
   -- Pick the part under the pointer (select + highlight + report).
   if self.pickEnabled then
     local px, py = eventToCanvas(self, event)
     local hit = pickPart(self, px, py)
+    local changed = hit ~= self.selectedPart
     self.selectedPart = hit
     refreshHighlight(self)
     reportPick(self)
+    if changed and hit > 0 then
+      fireTrigger(self, self.pickTriggerName)
+    end
     if hit > 0 then
       handled = true
     end
@@ -2009,6 +3576,45 @@ function pointerDown(self: Model, event: PointerEvent)
 end
 
 function pointerMove(self: Model, event: PointerEvent)
+  local tracked = self.activePointers[event.id]
+  if tracked then
+    tracked[1], tracked[2] = event.position.x, event.position.y
+  end
+  -- Pinch zoom + two-finger pan.
+  if self.pinching and self.interactive then
+    local ids = pointerIds(self)
+    if #ids >= 2 then
+      local a = self.activePointers[ids[1]]
+      local b = self.activePointers[ids[2]]
+      local dx, dy = b[1] - a[1], b[2] - a[2]
+      local dist = math.max(20, math.sqrt(dx * dx + dy * dy))
+      -- fingers apart = zoom in (smaller distance multiplier)
+      self.zoom = self.pinchBaseZoom * (self.pinchBaseDist / dist)
+      -- pan: move the camera target with the centroid
+      local cx2 = (a[1] + b[1]) * 0.5
+      local cy2 = (a[2] + b[2]) * 0.5
+      local mdx = cx2 - self.pinchLastCX
+      local mdy = cy2 - self.pinchLastCY
+      self.pinchLastCX, self.pinchLastCY = cx2, cy2
+      local gpu = self.gpu
+      local cam = self.camWorld
+      if gpu and cam and gpu.height > 0 and (mdx ~= 0 or mdy ~= 0) then
+        local wpp = 2 * self.lastDist * math.tan(self.fovYRad * 0.5)
+          / gpu.height
+        -- camera right = column 0, camera up = column 1 of the world matrix
+        self.panOffX -= (cam[1] * mdx - cam[5] * mdy) * wpp
+        self.panOffY -= (cam[2] * mdx - cam[6] * mdy) * wpp
+        self.panOffZ -= (cam[3] * mdx - cam[7] * mdy) * wpp
+      end
+      updateCamera(self)
+      if self.context then
+        self.context:markNeedsUpdate()
+      end
+      event:hit()
+      return
+    end
+    self.pinching = false -- lost a finger without an up event
+  end
   -- Keep the component's hover states live (unless an orbit drag is active,
   -- which owns the pointer until release).
   if not self.dragging then
@@ -2026,6 +3632,8 @@ function pointerMove(self: Model, event: PointerEvent)
     self.lastPointerY = event.position.y
     self.dragYaw += dx * self.dragSpeed
     self.dragPitch += dy * self.dragSpeed
+    self.flickDX += dx -- advance() turns these into the flick velocity
+    self.flickDY += dy
     updateCamera(self)
     if self.context then
       self.context:markNeedsUpdate()
@@ -2038,6 +3646,9 @@ function pointerMove(self: Model, event: PointerEvent)
     if hit ~= self.hoveredPart then
       self.hoveredPart = hit
       refreshHighlight(self)
+      if hit > 0 then
+        fireTrigger(self, self.hoverTriggerName)
+      end
     end
     if hit > 0 then
       event:hit()
@@ -2046,6 +3657,22 @@ function pointerMove(self: Model, event: PointerEvent)
 end
 
 function pointerUp(self: Model, event: PointerEvent)
+  self.activePointers[event.id] = nil
+  if self.pinching then
+    local ids = pointerIds(self)
+    if #ids < 2 then
+      self.pinching = false
+      if #ids == 1 then
+        -- continue as a one-finger orbit from the remaining pointer
+        local p = self.activePointers[ids[1]]
+        self.dragging = true
+        self.lastPointerX, self.lastPointerY = p[1], p[2]
+        self.flickDX, self.flickDY = 0, 0
+      end
+    end
+    event:hit()
+    return
+  end
   if self.dragging then
     self.dragging = false
     event:hit()
@@ -2061,12 +3688,18 @@ end
 
 function pointerExit(self: Model, event: PointerEvent)
   self.dragging = false
-  -- Let the component clear its hover states too.
-  if self.compInstance ~= nil and self.compPointerInside then
-    self.compPointerInside = false
-    pcall(function()
-      self.compInstance:pointerExit(PointerEvent.new(event.id, Vector.xy(0, 0)))
-    end)
+  self.pinching = false
+  self.activePointers = {}
+  -- Let the components clear their hover states too.
+  for _, slot in ipairs(self.compSlots) do
+    if slot.instance ~= nil and slot.pointerInside then
+      slot.pointerInside = false
+      pcall(function()
+        slot.instance:pointerExit(
+          PointerEvent.new(event.id, Vector.xy(0, 0))
+        )
+      end)
+    end
   end
   -- Clear hover highlight when the pointer leaves.
   if self.hoveredPart ~= 0 then
@@ -2125,6 +3758,48 @@ return function(): Node<Model>
     bgColor = Color.rgba(13, 15, 20, 1),
     bgAlpha = 1,
 
+    -- SHADING MODE
+    shadingMode = 0,
+    toonSteps = 4,
+    wireWidth = 1,
+
+    -- ENVIRONMENT / IBL
+    envName = '',
+    envIntensity = 100,
+    envYaw = 0,
+    skyColor = Color.rgba(96, 118, 153, 255),
+    horizonColor = Color.rgba(178, 168, 152, 255),
+    groundColor = Color.rgba(48, 43, 38, 255),
+
+    -- SHADOW
+    shadowEnabled = false,
+    shadowSize = 1024,
+    shadowStrength = 60,
+    shadowBias = 0.0025,
+    shadowSoftness = 1.5,
+
+    -- POST FX
+    postEnabled = false,
+    postShaderName = 'post',
+    bloomEnabled = false,
+    bloomThreshold = 0.7,
+    bloomIntensity = 0.8,
+    vignetteAmount = 0,
+    vignetteRadius = 0.55,
+    vignetteSoftness = 0.45,
+    gradeEnabled = false,
+    gradeExposure = 1,
+    gradeContrast = 1,
+    gradeSaturation = 1,
+    dofEnabled = false,
+    dofAutoFocus = true,
+    dofFocus = 0.5,
+    dofRange = 0.08,
+    dofRadius = 6,
+
+    -- GLB CAMERA
+    cameraIndex = -1,
+
     -- MATERIAL
     tint = Color.rgba(255, 255, 255, 1),
     metallicMul = 0.1,
@@ -2144,11 +3819,15 @@ return function(): Node<Model>
     materialIndex = 0,
     texturePropName = '',
 
-    -- component-as-texture
+    -- component-as-texture (slots A/B/C)
     componentArtboard = late(),
     componentMatIndex = 0,
     componentSize = 512,
     componentInteractive = true,
+    componentArtboardB = late(),
+    componentMatIndexB = 1,
+    componentArtboardC = late(),
+    componentMatIndexC = 2,
 
     -- ANIMATION
     animationIndex = 0,
@@ -2166,13 +3845,27 @@ return function(): Node<Model>
     hoverHighlight = false,
     highlightColor = Color.rgba(255, 200, 40, 255),
     highlightStrength = 0.6,
+    pickPrecise = true,
+    selectPropName = '',
+    pickTriggerName = '',
+    hoverTriggerName = '',
+
+    -- camera UX
+    pitchMin = -89,
+    pitchMax = 89,
+    zoomMin = 0.25,
+    zoomMax = 4,
+    inertia = 0.55,
+    focusOnSelect = false,
 
     gpu = late(),
     depth = late(),
     msaaColor = late(),
     pipeline = late(),
+    pipelineBlend = late(),
     sampler = late(),
     gpuSampler = late(),
+    layout0 = late(),
     layout1 = late(),
     frameBuf = late(),
     frameBind = late(),
@@ -2180,6 +3873,45 @@ return function(): Node<Model>
     objBytes = late(),
     matBinds = {},
     fallbackBind = late(),
+
+    -- shadow pass
+    shadowTex = late(),
+    shadowDepthTex = late(),
+    shadowPipeline = late(),
+    frameBindShadow = late(),
+    clampSampler = late(),
+
+    -- environment (IBL)
+    envTexture = late(),
+    envSampler = late(),
+    envMaxLod = 0,
+    envMode = 0,
+
+    -- post fx
+    sceneTex = late(),
+    brightTex = late(),
+    blurTexA = late(),
+    blurTexB = late(),
+    fsIbo = late(),
+    postBufBright = late(),
+    postBufBlurH = late(),
+    postBufBlurV = late(),
+    postBufComposite = late(),
+    postPipeBright = late(),
+    postPipeBlur = late(),
+    postPipeComposite = late(),
+    postBindBright = late(),
+    postBindBlurH = late(),
+    postBindBlurV = late(),
+    postBindComposite = late(),
+    postActive = false,
+
+    -- camera bookkeeping
+    viewMat = late(),
+    far = 1,
+    dofFocusAuto = 0.5,
+    lastDist = 1,
+    shadowMapSize = 1024,
     context = late(),
     whiteView = late(),
     imageViews = {},
@@ -2200,6 +3932,9 @@ return function(): Node<Model>
     -- interactivity / picking state
     parts = {},
     partAABBs = {},
+    nodeToPartIdx = {},
+    pickMesh = late(),
+    pickMeshKey = '',
     camWorld = late(),
     fovYRad = 0,
     dragYaw = 0,
@@ -2212,15 +3947,33 @@ return function(): Node<Model>
     pickProp = late(),
     pickIndexProp = late(),
     pickNodeProp = late(),
+    selectProp = late(),
 
-    -- component-as-texture state
-    compInstance = late(),
-    compCanvas = late(),
-    compTexture = late(),
-    compMatBound = -1,
-    compMesh = late(),
-    compBounds = { 0, 0, 1, 1 },
-    compPointerInside = false,
+    -- gestures / inertia / focus glide
+    activePointers = {},
+    pinching = false,
+    pinchBaseDist = 1,
+    pinchBaseZoom = 1,
+    pinchLastCX = 0,
+    pinchLastCY = 0,
+    zoom = 1,
+    panOffX = 0,
+    panOffY = 0,
+    panOffZ = 0,
+    velYaw = 0,
+    velPitch = 0,
+    flickDX = 0,
+    flickDY = 0,
+    focusCx = 0,
+    focusCy = 0,
+    focusCz = 0,
+    focusR = 1,
+
+    -- animated pose cache
+    lastWorld = late(),
+
+    -- component-as-texture state (slots A/B/C)
+    compSlots = {},
 
     init = init,
     update = update,
