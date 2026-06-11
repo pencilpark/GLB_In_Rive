@@ -50,3 +50,23 @@ référence, via un harnais luau CLI (fixtures base64) :
   ETC1S 4096²) parse en ~26 ms; géométrie identique à la référence; mixed
   draco+ktx2 OK. ETC1S 4096² ≈ 1.5–2.3 s/texture (CPU, niveau 0 seulement).
 - luau-analyze sans erreur sur les 9 modules (mode strict).
+
+# Geometry extensions: cameras, morph targets, pick mesh, glTF projections
+
+Branch agent-a-geometry.
+
+- [x] GLBParser: glTF cameras (flattened Camera type, GLBData.cameras, Node.camera)
+- [x] GLBParser: morph targets (Primitive.targets, Mesh.weights, Node.weights)
+- [x] GLBParser: material extension factors (clearcoat, transmission, sheen, specular, ior)
+- [x] GLBParser fix: accessor.bufferView keeps nil (was `or 0`), so sparse-only
+      accessors (zero base) no longer alias bufferView 0 -- required for sparse
+      morph deltas; Draco accessors unaffected (overrides short-circuit first)
+- [x] SceneGraph: sampleClip second return = per-node morph weights
+      (LINEAR/STEP/CUBICSPLINE), first return unchanged
+- [x] SceneGraph: applyMorphs (base + sum w_i * delta_i, POSITION/NORMAL)
+- [x] SceneGraph: PickMesh / buildPickMesh / rayPickMesh (triangle-precise,
+      per-triangle node id, optional world-space position overrides)
+- [x] Math3D: perspectiveGltfReverseZ (zfar nil = infinite far), orthographicReverseZ
+- [x] Tests in /tmp/t/luau_A: hand-built fixture GLB (sparse morph target,
+      weights anims, cameras, extension materials); 145 checks + full
+      regression suite green; luau-analyze clean on all touched modules
