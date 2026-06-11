@@ -32,6 +32,20 @@ Each `.luau` file must be added as a script asset with its exact name:
 `GLBModel` (the node script), `GLBParser`, `GLTFMesh`, `Math3D`, `SceneGraph`,
 `MeshoptDecoder`, `DracoDecoder`, `ZstdDecoder`, `KTX2Decoder`, `WebPDecoder`.
 
+## Component as interactive texture
+
+Assign a component (nested artboard) to the **componentArtboard** input and it is rendered every frame into an offscreen canvas, then used as the base-colour texture of the material selected by **componentMatIndex** (resolution: **componentSize**, default 512). The component's own animations, state machines and data bindings keep running.
+
+With **componentInteractive** enabled (default), pointer events on the 3D surface are ray-cast against the mesh, converted to the surface's UV coordinates and forwarded into the component, so buttons and hover states inside the component respond where you touch the model. Notes: forwarding uses the rest-pose geometry (same as part picking), presses landing on the component-textured surface take priority over orbit/selection, and the databound image override is ignored for that material while the component drives it.
+
+## Part picking
+
+With **pickEnabled**, clicking a part selects and highlights it, and the script writes to optional ViewModel properties (create the ones you need):
+
+- String named by **pickPropName**: the part (node) name
+- Number named by **pickIndexPropName**: the part-list ordinal, 0-based, -1 when nothing is selected
+- Number named by **pickNodePropName**: the glTF node index of the part, stable for a given file, -1 when nothing is selected
+
 ## Notes
 
 - This `.rev` is an example using a relatively heavy GLB file with no animation.

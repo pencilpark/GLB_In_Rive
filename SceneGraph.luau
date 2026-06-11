@@ -458,4 +458,134 @@ function SceneGraph.skinVertices(
   return outP, outN
 end
 
+-- A CPU triangle soup used for UV-accurate ray picking: world-space positions
+-- (9 numbers per triangle) and matching uv0 coordinates (6 per triangle).
+export type TriMesh = {
+  positions: { number },
+  uvs: { number },
+  triCount: number,
+}
+
+-- Build the world-space TriMesh of every primitive that uses the given
+-- material (rest pose): positions transformed by the node world matrices,
+-- uv0 carried per corner. Returns nil when no UV-mapped triangle matches.
+function SceneGraph.buildMaterialTriMesh(
+  glb: GLBData,
+  matIndex: number
+): TriMesh?
+  local world = SceneGraph.computeWorldMatrices(glb)
+  local nodes: { GLBParser.Node } = glb.nodes or {}
+  local positions: { number } = {}
+  local uvs: { number } = {}
+  local triCount = 0
+  for idx = 0, #nodes - 1 do
+    local node = nodes[idx + 1]
+    local w = world[idx]
+    local meshIdx = node.mesh
+    if meshIdx ~= nil and w then
+      local mesh = glb.meshes[meshIdx + 1]
+      if mesh then
+        for _, prim in ipairs(mesh.primitives) do
+          local posIdx = prim.attributes.POSITION
+          local uvIdx = prim.attributes.TEXCOORD_0
+          if prim.material == matIndex and posIdx ~= nil then
+            local pos = GLBParser.readAccessorFloats(glb, posIdx + 1)
+            local uv: { number }? = nil
+            if uvIdx ~= nil then
+              uv = GLBParser.readAccessorFloats(glb, uvIdx + 1)
+            end
+            if pos and uv then
+              local p = pos :: { number }
+              local u = uv :: { number }
+              local indices: { number }
+              local idxAcc = prim.indices
+              if idxAcc ~= nil then
+                indices = GLBParser.readIndices(glb, idxAcc + 1) or {}
+              else
+                indices = {}
+                for i = 0, math.floor(#p / 3) - 1 do
+                  indices[i + 1] = i
+                end
+              end
+              for t = 0, math.floor(#indices / 3) - 1 do
+                for k = 1, 3 do
+                  local vi = indices[t * 3 + k]
+                  local wx, wy, wz = M3.transformPoint(
+                    w,
+                    p[vi * 3 + 1],
+                    p[vi * 3 + 2],
+                    p[vi * 3 + 3]
+                  )
+                  table.insert(positions, wx)
+                  table.insert(positions, wy)
+                  table.insert(positions, wz)
+                  table.insert(uvs, u[vi * 2 + 1] or 0)
+                  table.insert(uvs, u[vi * 2 + 2] or 0)
+                end
+                triCount += 1
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+  if triCount == 0 then
+    return nil
+  end
+  return { positions = positions, uvs = uvs, triCount = triCount }
+end
+
+-- Ray / triangle-mesh intersection (Moller-Trumbore over a TriMesh).
+-- Returns (t, u, v) for the NEAREST hit, where (u, v) is the interpolated
+-- uv0 coordinate at the hit point -- or nil when nothing is hit.
+function SceneGraph.rayMeshUV(
+  mesh: TriMesh,
+  ox: number, oy: number, oz: number,
+  dx: number, dy: number, dz: number
+): (number?, number, number)
+  local P = mesh.positions
+  local U = mesh.uvs
+  local bestT: number? = nil
+  local bestU, bestV = 0, 0
+  for tri = 0, mesh.triCount - 1 do
+    local p = tri * 9
+    local ax, ay, az = P[p + 1], P[p + 2], P[p + 3]
+    local e1x = P[p + 4] - ax
+    local e1y = P[p + 5] - ay
+    local e1z = P[p + 6] - az
+    local e2x = P[p + 7] - ax
+    local e2y = P[p + 8] - ay
+    local e2z = P[p + 9] - az
+    -- h = d x e2
+    local hx = dy * e2z - dz * e2y
+    local hy = dz * e2x - dx * e2z
+    local hz = dx * e2y - dy * e2x
+    local det = e1x * hx + e1y * hy + e1z * hz
+    if math.abs(det) > 1e-12 then
+      local inv = 1 / det
+      local sx, sy, sz = ox - ax, oy - ay, oz - az
+      local bu = (sx * hx + sy * hy + sz * hz) * inv
+      if bu >= 0 and bu <= 1 then
+        -- q = s x e1
+        local qx = sy * e1z - sz * e1y
+        local qy = sz * e1x - sx * e1z
+        local qz = sx * e1y - sy * e1x
+        local bv = (dx * qx + dy * qy + dz * qz) * inv
+        if bv >= 0 and bu + bv <= 1 then
+          local t = (e2x * qx + e2y * qy + e2z * qz) * inv
+          if t > 1e-6 and (bestT == nil or t < bestT :: number) then
+            bestT = t
+            local q = tri * 6
+            local w = 1 - bu - bv
+            bestU = w * U[q + 1] + bu * U[q + 3] + bv * U[q + 5]
+            bestV = w * U[q + 2] + bu * U[q + 4] + bv * U[q + 6]
+          end
+        end
+      end
+    end
+  end
+  return bestT, bestU, bestV
+end
+
 return SceneGraph

@@ -174,6 +174,17 @@ type Model = {
   texturePropName: Input<string>, -- name of the ViewModel Image property to read
 
   -- ======================================================================
+  -- COMPONENT-AS-TEXTURE -- render a Rive component (nested artboard) into
+  -- an offscreen canvas every frame and use it as the base-colour texture
+  -- of one material. Pointer events can be forwarded onto the component
+  -- through the mesh's UVs, making the texture fully interactive.
+  -- ======================================================================
+  componentArtboard: Input<Artboard<nil>>, -- the component to instantiate (assign in the editor)
+  componentMatIndex: Input<number>, -- 0-based material that receives the live texture
+  componentSize: Input<number>, -- offscreen resolution in pixels (square)
+  componentInteractive: Input<boolean>, -- forward pointer events via UV ray casting
+
+  -- ======================================================================
   -- ANIMATION (live / keyframeable)
   -- ======================================================================
   animationIndex: Input<number>, -- 0-based
@@ -189,6 +200,7 @@ type Model = {
   pickEnabled: Input<boolean>, -- true -> clicking a part selects/highlights it
   pickPropName: Input<string>, -- ViewModel String property to receive the picked part name
   pickIndexPropName: Input<string>, -- ViewModel Number property to receive the picked part index (-1 = none)
+  pickNodePropName: Input<string>, -- ViewModel Number property to receive the picked part's glTF node index (-1 = none)
   hoverHighlight: Input<boolean>, -- true -> highlight the part under the pointer on move
   highlightColor: Input<Color>, -- colour used to highlight the hovered/selected part
   highlightStrength: Input<number>, -- 0..1 blend strength of the highlight
@@ -230,6 +242,15 @@ type Model = {
   animDuration: number,
   animTime: number,
 
+  -- component-as-texture state
+  compInstance: any, -- Artboard instance (advanced + drawn every frame)
+  compCanvas: any, -- offscreen vector Canvas
+  compTexture: GPUTexture?, -- GPU texture refreshed from compCanvas.image
+  compMatBound: number, -- material index currently bound (-1 = none)
+  compMesh: SceneGraph.TriMesh?, -- world-space triangles of that material (UV ray casting)
+  compBounds: { number }, -- artboard bounds {x, y, w, h} cached each frame
+  compPointerInside: boolean, -- to emit pointerExit when the ray leaves the part
+
   -- interactivity / picking state
   parts: { Part }, -- one entry per drawable node
   partAABBs: { SceneGraph.AABB? }, -- world-space AABB per part (index matches parts)
@@ -244,6 +265,7 @@ type Model = {
   hoveredPart: number, -- 1-based index into parts, or 0 = none
   pickProp: any, -- Property<string> for the picked part name (kept alive)
   pickIndexProp: any, -- Property<number> for the picked part index (kept alive)
+  pickNodeProp: any, -- Property<number> for the picked part's glTF node index (kept alive)
   debug: Input<number>, -- 0 normal, 1 raw base-colour, 2 UVs, 3 metal/rough, 4 emissive
 }
 
@@ -1142,7 +1164,10 @@ local function pickPart(self: Model, px: number, py: number): number
   return best
 end
 
--- Report the currently selected part to the ViewModel (name + index).
+-- Report the currently selected part to the ViewModel (name + indices).
+-- pickedPartIndex is the part-list ordinal (0-based, discovery order);
+-- pickedPartNode is the glTF node index, which is stable for a given file
+-- regardless of which parts are drawable.
 local function reportPick(self: Model)
   local part = if self.selectedPart > 0
     then self.parts[self.selectedPart]
@@ -1152,6 +1177,9 @@ local function reportPick(self: Model)
   end
   if self.pickIndexProp ~= nil then
     self.pickIndexProp.value = if part then (self.selectedPart - 1) else -1
+  end
+  if self.pickNodeProp ~= nil then
+    self.pickNodeProp.value = if part then part.nodeIndex else -1
   end
 end
 
@@ -1315,6 +1343,14 @@ local function applyMaterialImage(self: Model)
     return
   end
   local matIndex = math.floor(self.materialIndex)
+  if matIndex == self.compMatBound then
+    print(
+      '[GLBModel.tex] material '
+        .. matIndex
+        .. ' is driven by the component texture -- databound image ignored'
+    )
+    return
+  end
   if matIndex < 0 or matIndex >= #glb.materials then
     print(
       string.format(
@@ -1358,6 +1394,158 @@ local function applyMaterialImage(self: Model)
       (img.height or 0) :: number
     )
   )
+end
+
+-- ===========================================================================
+-- COMPONENT-AS-TEXTURE
+-- ===========================================================================
+
+-- Set up the component-as-texture pipeline: instantiate the artboard, create
+-- the offscreen canvas + GPU texture, install the texture view as the
+-- material's base-colour override and build the ray-casting mesh.
+local function initComponentTexture(self: Model, context: Context)
+  self.compMatBound = -1
+  self.compPointerInside = false
+  local glb = self.glb
+  if not glb then
+    return
+  end
+  local ab: any = (self :: any).componentArtboard
+  if ab == nil then
+    return -- no component assigned in the editor
+  end
+  local matIndex = math.floor(self.componentMatIndex)
+  if matIndex < 0 or matIndex >= #glb.materials then
+    print(
+      string.format(
+        '[GLBModel.comp] componentMatIndex %d out of range (0..%d) -- component texture disabled',
+        matIndex,
+        math.max(0, #glb.materials - 1)
+      )
+    )
+    return
+  end
+  local okInst, inst = pcall(function(): any
+    return ab:instance()
+  end)
+  if not okInst or inst == nil then
+    print('[GLBModel.comp] could not instantiate the component artboard: ' .. tostring(inst))
+    return
+  end
+  local size = math.max(8, math.floor(self.componentSize))
+  local okCanvas, canvas = pcall(function(): any
+    return (context :: any):canvas({
+      width = size,
+      height = size,
+      clearColor = Color.rgba(0, 0, 0, 0),
+    })
+  end)
+  if not okCanvas or canvas == nil then
+    print('[GLBModel.comp] context:canvas unavailable in this runtime: ' .. tostring(canvas))
+    return
+  end
+  local tex = GPUTexture.new({ width = size, height = size, format = 'rgba8unorm' })
+  self.compInstance = inst
+  self.compCanvas = canvas
+  self.compTexture = tex
+  self.compMatBound = matIndex
+  self.compBounds = { 0, 0, 1, 1 }
+  self.overrideBasePerMat[matIndex] = tex:view()
+  self.compMesh = SceneGraph.buildMaterialTriMesh(glb, matIndex)
+  if not self.compMesh then
+    print('[GLBModel.comp] note: no UV-mapped triangles use material ' .. matIndex .. '; pointer forwarding disabled')
+  end
+  print(
+    string.format(
+      '[GLBModel.comp] component texture active on material %d (%dx%d offscreen)',
+      matIndex,
+      size,
+      size
+    )
+  )
+end
+
+-- Render the component into the offscreen canvas and refresh the GPU
+-- texture. Runs at the start of drawCanvas, before the 3D pass samples it.
+local function renderComponentTexture(self: Model)
+  local inst, canvas, tex = self.compInstance, self.compCanvas, self.compTexture
+  if inst == nil or canvas == nil or tex == nil then
+    return
+  end
+  local ok, err = pcall(function()
+    local bMin, bMax = inst:bounds()
+    local bw = math.max(1e-6, bMax.x - bMin.x)
+    local bh = math.max(1e-6, bMax.y - bMin.y)
+    self.compBounds = { bMin.x, bMin.y, bw, bh }
+    local renderer = canvas:beginFrame()
+    renderer:save()
+    -- map the artboard bounds onto the full canvas (fills the UV square)
+    renderer:transform(Mat2D.withScale(canvas.width / bw, canvas.height / bh))
+    renderer:transform(Mat2D.withTranslation(-bMin.x, -bMin.y))
+    inst:draw(renderer)
+    renderer:restore()
+    canvas:endFrame()
+    tex:upload({ image = canvas.image })
+  end)
+  if not ok then
+    print('[GLBModel.comp] component render failed: ' .. tostring(err))
+  end
+end
+
+-- Forward a pointer event onto the component through the mesh UVs.
+-- Returns true when the ray hits the component-textured surface.
+local function forwardPointerToComponent(
+  self: Model,
+  event: PointerEvent,
+  kind: string
+): boolean
+  local inst = self.compInstance
+  local mesh = self.compMesh
+  if inst == nil or mesh == nil or not self.componentInteractive then
+    return false
+  end
+  local gpu = self.gpu
+  local camWorld = self.camWorld
+  if not gpu or not camWorld or gpu.width <= 0 or gpu.height <= 0 then
+    return false
+  end
+  local ndcX = (event.position.x / gpu.width) * 2 - 1
+  local ndcY = 1 - (event.position.y / gpu.height) * 2
+  local aspect = gpu.width / gpu.height
+  local ox, oy, oz, dx, dy, dz =
+    Math3D.screenRay(camWorld, self.fovYRad, aspect, ndcX, ndcY)
+  local t, u, v = SceneGraph.rayMeshUV(mesh :: SceneGraph.TriMesh, ox, oy, oz, dx, dy, dz)
+  if t == nil then
+    if self.compPointerInside and kind ~= 'up' then
+      self.compPointerInside = false
+      pcall(function()
+        inst:pointerExit(PointerEvent.new(event.id, Vector.xy(0, 0)))
+      end)
+    end
+    return false
+  end
+  -- glTF UVs wrap; mirror the shader's flipV toggle so the touch point lands
+  -- on the pixel actually shown.
+  u = u % 1
+  v = v % 1
+  if self.flipV then
+    v = 1 - v
+  end
+  local b = self.compBounds
+  local ax = b[1] + u * b[3]
+  local ay = b[2] + v * b[4]
+  local ev = PointerEvent.new(event.id, Vector.xy(ax, ay))
+  self.compPointerInside = true
+  pcall(function()
+    if kind == 'down' then
+      inst:pointerDown(ev)
+    elseif kind == 'up' then
+      inst:pointerUp(ev)
+    else
+      inst:pointerMove(ev)
+    end
+  end)
+  return true
 end
 
 function init(self: Model, context: Context): boolean
@@ -1598,6 +1786,13 @@ function init(self: Model, context: Context): boolean
   if vm and self.pickIndexPropName ~= '' then
     self.pickIndexProp = vm:getNumber(self.pickIndexPropName)
   end
+  if vm and self.pickNodePropName ~= '' then
+    self.pickNodeProp = vm:getNumber(self.pickNodePropName)
+  end
+
+  -- Component-as-texture: instantiate + install the live texture override
+  -- BEFORE the first bind build so the material samples it from frame one.
+  initComponentTexture(self, context)
 
   -- Bind immediately (overrides + white fallback), then decode embedded GLB
   -- textures in the background and rebind as they finish.
@@ -1636,11 +1831,32 @@ function update(self: Model)
   if math.floor(self.materialIndex) ~= self.lastBoundMatIndex then
     applyMaterialImage(self)
   end
+  -- If componentMatIndex changed, move the live component texture to the new
+  -- material (and rebuild the ray-casting mesh to match).
+  do
+    local glb = self.glb
+    local tex = self.compTexture
+    if glb and tex and self.compMatBound >= 0 then
+      local want = math.floor(self.componentMatIndex)
+      if want ~= self.compMatBound and want >= 0 and want < #glb.materials then
+        self.overrideBasePerMat[self.compMatBound] = nil
+        self.compMatBound = want
+        self.overrideBasePerMat[want] = (tex :: GPUTexture):view()
+        self.compMesh = SceneGraph.buildMaterialTriMesh(glb, want)
+        rebuildMatBinds(self)
+      end
+    end
+  end
   updateCamera(self) -- re-push camera/light/material params on any input change
 end
 
 function advance(self: Model, seconds: number): boolean
   self.angle += math.rad(self.autoSpin) * seconds
+  if self.compInstance ~= nil then
+    pcall(function()
+      self.compInstance:advance(seconds)
+    end)
+  end
   local glb, objBuf, objBytes = self.glb, self.objBuf, self.objBytes
   if self.hasAnim and self.animDuration > 0 and glb and objBuf and objBytes then
     if self.playAnimation then
@@ -1670,6 +1886,8 @@ function advance(self: Model, seconds: number): boolean
 end
 
 function drawCanvas(self: Model)
+  -- refresh the component texture before the 3D pass samples it
+  renderComponentTexture(self)
   local gpu, pipeline, depth, frameBind =
     self.gpu, self.pipeline, self.depth, self.frameBind
   if not gpu or not pipeline or not depth or not frameBind then
@@ -1757,6 +1975,16 @@ end
 
 function pointerDown(self: Model, event: PointerEvent)
   local handled = false
+  -- The interactive component texture gets first dibs: when the press lands
+  -- on the component-textured surface, forward it instead of starting an
+  -- orbit drag or changing the selection.
+  if forwardPointerToComponent(self, event, 'down') then
+    if self.context then
+      self.context:markNeedsUpdate()
+    end
+    event:hit()
+    return
+  end
   -- Start an orbit drag (interactive mode only).
   if self.interactive then
     self.dragging = true
@@ -1781,6 +2009,15 @@ function pointerDown(self: Model, event: PointerEvent)
 end
 
 function pointerMove(self: Model, event: PointerEvent)
+  -- Keep the component's hover states live (unless an orbit drag is active,
+  -- which owns the pointer until release).
+  if not self.dragging then
+    if forwardPointerToComponent(self, event, 'move') then
+      if self.context then
+        self.context:markNeedsUpdate()
+      end
+    end
+  end
   -- Orbit drag: accumulate the delta into the keyframeable drag offsets.
   if self.interactive and self.dragging then
     local dx = event.position.x - self.lastPointerX
@@ -1812,11 +2049,25 @@ function pointerUp(self: Model, event: PointerEvent)
   if self.dragging then
     self.dragging = false
     event:hit()
+    return
+  end
+  if forwardPointerToComponent(self, event, 'up') then
+    if self.context then
+      self.context:markNeedsUpdate()
+    end
+    event:hit()
   end
 end
 
 function pointerExit(self: Model, event: PointerEvent)
   self.dragging = false
+  -- Let the component clear its hover states too.
+  if self.compInstance ~= nil and self.compPointerInside then
+    self.compPointerInside = false
+    pcall(function()
+      self.compInstance:pointerExit(PointerEvent.new(event.id, Vector.xy(0, 0)))
+    end)
+  end
   -- Clear hover highlight when the pointer leaves.
   if self.hoveredPart ~= 0 then
     self.hoveredPart = 0
@@ -1893,6 +2144,12 @@ return function(): Node<Model>
     materialIndex = 0,
     texturePropName = '',
 
+    -- component-as-texture
+    componentArtboard = late(),
+    componentMatIndex = 0,
+    componentSize = 512,
+    componentInteractive = true,
+
     -- ANIMATION
     animationIndex = 0,
     animationSpeed = 0,
@@ -1905,6 +2162,7 @@ return function(): Node<Model>
     pickEnabled = false,
     pickPropName = '',
     pickIndexPropName = '',
+    pickNodePropName = '',
     hoverHighlight = false,
     highlightColor = Color.rgba(255, 200, 40, 255),
     highlightStrength = 0.6,
@@ -1953,6 +2211,16 @@ return function(): Node<Model>
     hoveredPart = 0,
     pickProp = late(),
     pickIndexProp = late(),
+    pickNodeProp = late(),
+
+    -- component-as-texture state
+    compInstance = late(),
+    compCanvas = late(),
+    compTexture = late(),
+    compMatBound = -1,
+    compMesh = late(),
+    compBounds = { 0, 0, 1, 1 },
+    compPointerInside = false,
 
     init = init,
     update = update,
