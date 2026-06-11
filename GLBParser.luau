@@ -38,7 +38,7 @@ export type AccessorSparse = {
 }
 
 export type Accessor = {
-	bufferView: number,
+	bufferView: number?, -- absent for sparse-only / Draco-compressed accessors
 	byteOffset: number,
 	componentType: number,
 	count: number,
@@ -62,11 +62,15 @@ export type Primitive = {
 	material: number?,
 	mode: number?,
 	draco: DracoExt?,
+	-- Morph targets: one map per target, semantic -> accessor index
+	-- (POSITION / NORMAL / TANGENT deltas).
+	targets: { { [string]: number } }?,
 }
 
 export type Mesh = {
 	name: string?,
 	primitives: { Primitive },
+	weights: { number }?, -- default morph target weights
 }
 
 -- Node in the scene graph (used for skeleton hierarchy)
@@ -75,10 +79,26 @@ export type Node = {
 	children: { number }?, -- indices of child nodes
 	mesh: number?, -- index of mesh (if any)
 	skin: number?, -- index of skin (if any)
+	camera: number?, -- index of camera (if any)
 	translation: { number }?, -- [x, y, z]
 	rotation: { number }?, -- [x, y, z, w] quaternion
 	scale: { number }?, -- [x, y, z]
 	matrix: { number }?, -- 4x4 column-major matrix (alternative to TRS)
+	weights: { number }?, -- morph weights overriding the mesh defaults
+}
+
+-- glTF camera, with the perspective/orthographic sub-object flattened.
+-- type is "perspective" (yfov/znear/zfar/aspectRatio set) or "orthographic"
+-- (xmag/ymag/znear/zfar set).
+export type Camera = {
+	name: string?,
+	type: string,
+	yfov: number?, -- vertical field of view, radians
+	znear: number?,
+	zfar: number?, -- nil = infinite far plane (perspective only)
+	aspectRatio: number?,
+	xmag: number?, -- half horizontal orthographic magnification
+	ymag: number?, -- half vertical orthographic magnification
 }
 
 -- Skin defines the skeleton for mesh skinning
@@ -147,6 +167,15 @@ export type Material = {
 	alphaMode: string, -- "OPAQUE" | "MASK" | "BLEND"
 	alphaCutoff: number,
 	doubleSided: boolean,
+	-- Material extension factors (textures of these extensions are not parsed).
+	clearcoatFactor: number, -- KHR_materials_clearcoat (default 0)
+	clearcoatRoughnessFactor: number, -- KHR_materials_clearcoat (default 0)
+	transmissionFactor: number, -- KHR_materials_transmission (default 0)
+	sheenColorFactor: { number }, -- KHR_materials_sheen {r,g,b} (default {0,0,0})
+	sheenRoughnessFactor: number, -- KHR_materials_sheen (default 0)
+	specularFactor: number, -- KHR_materials_specular (default 1)
+	specularColorFactor: { number }, -- KHR_materials_specular {r,g,b} (default {1,1,1})
+	ior: number, -- KHR_materials_ior (default 1.5)
 }
 
 export type TextureDef = {
@@ -184,6 +213,7 @@ export type GLBData = {
 	nodes: { Node }?,
 	skins: { Skin }?,
 	animations: { Animation }?,
+	cameras: { Camera }?,
 	scene: number?, -- index of default scene
 	scenes: { { nodes: { number }? } }?, -- scene definitions
 	materials: { Material },
@@ -465,17 +495,21 @@ local function parse(data: buffer): ParseResult
 					["KHR_texture_transform"] = "UV transforms (baked into UVs)",
 					["KHR_mesh_quantization"] = "quantized attributes",
 				}
+				-- Material extensions whose scalar/colour FACTORS are parsed onto
+				-- Material (their texture slots are not).
+				local FACTORS_PARSED: { [string]: boolean } = {
+					["KHR_materials_ior"] = true,
+					["KHR_materials_clearcoat"] = true,
+					["KHR_materials_sheen"] = true,
+					["KHR_materials_transmission"] = true,
+					["KHR_materials_specular"] = true,
+				}
 				-- Extensions that are safe to ignore (rendering still works, just
 				-- without that specific embellishment).
 				local KNOWN_IGNORED: { [string]: boolean } = {
 					["KHR_materials_unlit"] = true,
 					["KHR_materials_emissive_strength"] = true,
-					["KHR_materials_ior"] = true,
-					["KHR_materials_clearcoat"] = true,
-					["KHR_materials_sheen"] = true,
-					["KHR_materials_transmission"] = true,
 					["KHR_materials_volume"] = true,
-					["KHR_materials_specular"] = true,
 					["KHR_lights_punctual"] = true,
 					["KHR_materials_variants"] = true,
 				}
@@ -491,6 +525,12 @@ local function parse(data: buffer): ParseResult
 									.. "' ("
 									.. DECODED[ext]
 									.. ") -- decoded."
+							)
+						elseif FACTORS_PARSED[ext] then
+							print(
+								"[GLBParser] extension '"
+									.. tostring(ext)
+									.. "' -- factors parsed (textures ignored)."
 							)
 						elseif KNOWN_IGNORED[ext] then
 							print(
@@ -527,8 +567,13 @@ local function parse(data: buffer): ParseResult
 		material: number?,
 		mode: number?,
 		extensions: any?,
+		targets: { { [string]: number } }?,
 	}
-	type JsonMesh = { name: string?, primitives: { JsonPrimitive }? }
+	type JsonMesh = {
+		name: string?,
+		primitives: { JsonPrimitive }?,
+		weights: { number }?,
+	}
 	type JsonAccessor = {
 		bufferView: number?,
 		byteOffset: number?,
@@ -556,10 +601,12 @@ local function parse(data: buffer): ParseResult
 		children: { number }?,
 		mesh: number?,
 		skin: number?,
+		camera: number?,
 		translation: { number }?,
 		rotation: { number }?,
 		scale: { number }?,
 		matrix: { number }?,
+		weights: { number }?,
 	}
 	type JsonSkin = {
 		name: string?,
@@ -597,6 +644,7 @@ local function parse(data: buffer): ParseResult
 			local mesh: Mesh = {
 				name = meshJson.name,
 				primitives = {},
+				weights = meshJson.weights,
 			}
 
 			if meshJson.primitives then
@@ -619,6 +667,7 @@ local function parse(data: buffer): ParseResult
 						material = primJson.material,
 						mode = primJson.mode or 4, -- Default to TRIANGLES
 						draco = draco,
+						targets = primJson.targets,
 					}
 					table.insert(mesh.primitives, prim)
 				end
@@ -646,7 +695,9 @@ local function parse(data: buffer): ParseResult
 				}
 			end
 			local accessor: Accessor = {
-				bufferView = accJson.bufferView or 0,
+				-- Keep absence as nil: a sparse accessor without a bufferView has
+				-- an all-zero base, which must not alias bufferView 0.
+				bufferView = accJson.bufferView,
 				byteOffset = accJson.byteOffset or 0,
 				componentType = accJson.componentType,
 				count = accJson.count,
@@ -730,10 +781,12 @@ local function parse(data: buffer): ParseResult
 				children = nodeJson.children,
 				mesh = nodeJson.mesh,
 				skin = nodeJson.skin,
+				camera = nodeJson.camera,
 				translation = nodeJson.translation,
 				rotation = nodeJson.rotation,
 				scale = nodeJson.scale,
 				matrix = nodeJson.matrix,
+				weights = nodeJson.weights,
 			}
 			table.insert(nodes :: { Node }, node)
 		end
@@ -792,6 +845,34 @@ local function parse(data: buffer): ParseResult
 			end
 
 			table.insert(animations :: { Animation }, anim)
+		end
+	end
+
+	-- Extract cameras, flattening the perspective/orthographic sub-object
+	-- into one record (camera.type says which fields are meaningful).
+	local cameras: { Camera }? = nil
+	if jsonData.cameras then
+		cameras = {}
+		for _, cRaw in ipairs(jsonData.cameras) do
+			local c = cRaw :: any
+			local cam: Camera = {
+				name = c.name,
+				type = (c.type or "") :: string,
+			}
+			local persp = c.perspective :: any
+			local ortho = c.orthographic :: any
+			if persp then
+				cam.yfov = persp.yfov :: number?
+				cam.znear = persp.znear :: number?
+				cam.zfar = persp.zfar :: number?
+				cam.aspectRatio = persp.aspectRatio :: number?
+			elseif ortho then
+				cam.xmag = ortho.xmag :: number?
+				cam.ymag = ortho.ymag :: number?
+				cam.znear = ortho.znear :: number?
+				cam.zfar = ortho.zfar :: number?
+			end
+			table.insert(cameras :: { Camera }, cam)
 		end
 	end
 
@@ -862,6 +943,41 @@ local function parse(data: buffer): ParseResult
 			if m.occlusionTexture and m.occlusionTexture.strength ~= nil then
 				occStrength = m.occlusionTexture.strength :: number
 			end
+			-- Material extension FACTORS (defaults per each extension's spec).
+			-- Their texture slots are intentionally not parsed.
+			local clearcoatFactor: number = 0
+			local clearcoatRoughnessFactor: number = 0
+			local transmissionFactor: number = 0
+			local sheenColorFactor: { number } = { 0, 0, 0 }
+			local sheenRoughnessFactor: number = 0
+			local specularFactor: number = 1
+			local specularColorFactor: { number } = { 1, 1, 1 }
+			local ior: number = 1.5
+			if exts then
+				local cc = exts.KHR_materials_clearcoat :: any
+				if cc then
+					clearcoatFactor = (cc.clearcoatFactor or 0) :: number
+					clearcoatRoughnessFactor = (cc.clearcoatRoughnessFactor or 0) :: number
+				end
+				local tr = exts.KHR_materials_transmission :: any
+				if tr then
+					transmissionFactor = (tr.transmissionFactor or 0) :: number
+				end
+				local sh = exts.KHR_materials_sheen :: any
+				if sh then
+					sheenColorFactor = (sh.sheenColorFactor or { 0, 0, 0 }) :: { number }
+					sheenRoughnessFactor = (sh.sheenRoughnessFactor or 0) :: number
+				end
+				local sp = exts.KHR_materials_specular :: any
+				if sp then
+					specularFactor = (sp.specularFactor or 1) :: number
+					specularColorFactor = (sp.specularColorFactor or { 1, 1, 1 }) :: { number }
+				end
+				local io = exts.KHR_materials_ior :: any
+				if io and io.ior ~= nil then
+					ior = io.ior :: number
+				end
+			end
 			-- Note: 0 is truthy in Lua, so `or` correctly preserves 0 factors.
 			local mat: Material = {
 				name = m.name,
@@ -880,6 +996,14 @@ local function parse(data: buffer): ParseResult
 				alphaMode = m.alphaMode or "OPAQUE",
 				alphaCutoff = m.alphaCutoff or 0.5,
 				doubleSided = m.doubleSided or false,
+				clearcoatFactor = clearcoatFactor,
+				clearcoatRoughnessFactor = clearcoatRoughnessFactor,
+				transmissionFactor = transmissionFactor,
+				sheenColorFactor = sheenColorFactor,
+				sheenRoughnessFactor = sheenRoughnessFactor,
+				specularFactor = specularFactor,
+				specularColorFactor = specularColorFactor,
+				ior = ior,
 			}
 			table.insert(materials, mat)
 		end
@@ -987,6 +1111,7 @@ local function parse(data: buffer): ParseResult
 		nodes = nodes,
 		skins = skins,
 		animations = animations,
+		cameras = cameras,
 		scene = sceneIndex,
 		scenes = scenes,
 		materials = materials,
@@ -1122,11 +1247,14 @@ local function readAccessorFloats(glb: GLBData, accessorIndex: number): { number
 		return result
 	end
 
-	local bufferView = glb.bufferViews[accessor.bufferView + 1] -- Convert to 1-indexed
+	local bvIndex = accessor.bufferView
+	local bufferView = if bvIndex ~= nil
+		then glb.bufferViews[bvIndex + 1] -- Convert to 1-indexed
+		else nil
 
-	if bufferView then
+	if bufferView and bvIndex ~= nil then
 		-- Normal path: read the base bufferView data.
-		local buf, viewBase = viewSource(glb, accessor.bufferView + 1)
+		local buf, viewBase = viewSource(glb, bvIndex + 1)
 		local stride = bufferView.byteStride or (componentSize * componentCount)
 		local baseOffset = viewBase + accessor.byteOffset
 		for i = 0, accessor.count - 1 do
@@ -1175,13 +1303,17 @@ local function readIndices(glb: GLBData, accessorIndex: number): { number }?
 		return result
 	end
 
-	local bufferView = glb.bufferViews[accessor.bufferView + 1]
+	local bvIndex = accessor.bufferView
+	if bvIndex == nil then
+		return nil
+	end
+	local bufferView = glb.bufferViews[bvIndex + 1]
 
 	if not bufferView then
 		return nil
 	end
 
-	local buf, viewBase = viewSource(glb, accessor.bufferView + 1)
+	local buf, viewBase = viewSource(glb, bvIndex + 1)
 	local componentSize = getComponentSize(accessor.componentType)
 	local baseOffset = viewBase + accessor.byteOffset
 	local result: { number } = {}
@@ -1224,13 +1356,17 @@ local function readJoints(glb: GLBData, accessorIndex: number): { number }?
 		return result
 	end
 
-	local bufferView = glb.bufferViews[accessor.bufferView + 1]
+	local bvIndex = accessor.bufferView
+	if bvIndex == nil then
+		return nil
+	end
+	local bufferView = glb.bufferViews[bvIndex + 1]
 
 	if not bufferView then
 		return nil
 	end
 
-	local buf, viewBase = viewSource(glb, accessor.bufferView + 1)
+	local buf, viewBase = viewSource(glb, bvIndex + 1)
 	local componentSize = getComponentSize(accessor.componentType)
 	local componentCount = getTypeComponents(accessor.accessorType) -- Should be 4 for VEC4
 
