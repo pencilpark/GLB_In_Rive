@@ -43,3 +43,23 @@ pas retomber dans les mêmes pièges.
   blocs; sinon TransformDC par bloc si DC non nul.
 - ETC1S 4096²: precomputer une LUT de 4 couleurs packées par endpoint et
   écrire en u32 → ~2x. Les écritures par octet dominent sinon.
+
+## WGSL / GPU Rive (PR #4)
+
+- wgsl_reflect (npm) a des exports cassés (WgslReflect non constructible en
+  require ET import): valider les WGSL avec naga-cli (cargo install naga-cli)
+  — c'est le validateur wgpu de référence.
+- naga refuse `let _ = expr` (identifiant `_` invalide): écrire le bloc
+  proprement avec select/mix plutôt que de "consommer" une binding.
+- Layouts de bind group dérivés du shader (GPUBindGroupLayout.new({shader,
+  groupIndex})): quand on étend le groupe 0, créer le bind group riche sous
+  pcall et retomber sur la version UBO-seule → un asset shader ancien garde
+  le comportement legacy au lieu de tuer le node.
+- Passe d'ombre sans comparison sampler: packer la profondeur en rgba8
+  (fract cascade), pipeline séparé en z standard (clear 1, less) même si la
+  passe principale est reverse-Z — seule la cohérence interne compte.
+- Accessors glTF sparse: bufferView ABSENT est légal (base zéro); `or 0`
+  aliasait silencieusement la view 0 (corrigé par agent A — piège classique
+  de défaut trop optimiste sur un champ optionnel).
+- Tri de transparence sans re-upload: lire la translation (octets 48/52/56)
+  du record déjà packé et la projeter sur la rangée z de la view.
