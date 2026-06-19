@@ -1,5 +1,9 @@
 # GLB_In_Rive
 
+
+https://github.com/user-attachments/assets/1a25f3b5-0a5b-49c5-b5e4-0937413074aa
+
+
 File embedding all scripts to add GLB file with all embedded properties.
 
 ## Overview
